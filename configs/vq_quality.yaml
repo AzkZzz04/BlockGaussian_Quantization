@@ -1,0 +1,68 @@
+# VQ High Quality Configuration - 3-layer RVQ for best compression
+# 高质量模式配置 - 3层残差VQ，最佳压缩效果和重建质量
+
+# scene params
+scene_dirpath: ./datasets/matrixcity/aerial/train/block_all
+output_dirpath: ./output/mc_aerial_vq_quality
+white_background: false
+sh_degree: 3
+evaluate: false
+scene_scale: 1.0
+image_scale: 0.5
+expand_ratio: 0.05
+vertical_axis: "z"
+max_tree_depth: 6
+num_points_thresh: 300000
+cover_ratio_thresh: 0.3
+
+# training params
+num_workers: 0
+batch_size: 1
+preload: "cpu"
+iterations: 25000  # 更多迭代获得更好质量
+
+position_lr_init: 0.00016
+position_lr_final: 0.0000016
+position_lr_delay_mult: 0.01
+position_lr_max_steps: None
+feature_lr: 0.0025
+opacity_lr: 0.025
+scaling_lr: 0.005
+rotation_lr: 0.001
+random_background: false
+
+lambda_dssim: 0.2
+depth_l1_weight_init: 1.0
+depth_l1_weight_final: 0.1
+reproj_l1_weight_init: 0.01
+reproj_l1_weight_final: 0.5
+depth_inv_loss: true
+pesudo_loss: true
+pesudo_loss_start: 5000
+
+# densify and prune params
+percent_dense: 0.01
+densify_grad_threshold: 0.0002
+densification_interval: 500
+densify_from_iter: 1000
+densify_until_iter: 25000
+opacity_reset_interval: 25000
+min_opacity: 0.005
+densify_only_in_block: true
+
+# rendering params
+convert_SHs_python: false
+compute_cov3D_python: false
+debug: false
+antialiasing: false
+
+# VQ parameters - High Quality Mode (3-layer RVQ)
+quant_params: ['sh', 'dc']
+rvq_layers: 3                   # 3层RVQ，最佳压缩质量
+vq_mode: 'online'
+kmeans_st_iter: 12000           # 更晚开始VQ，确保特征稳定
+kmeans_freq: 50                 # 更频繁的重分配，更好的量化质量
+kmeans_ncls_sh: 2048            # 更多聚类数，更高精度
+kmeans_ncls_dc: 8192            # 更多聚类数，更高精度
+kmeans_iters: 15                # 更多迭代获得更好的聚类
+# kmeans_max_samples removed - uses full data for optimal initialization 

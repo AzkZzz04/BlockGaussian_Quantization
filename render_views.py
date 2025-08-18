@@ -68,7 +68,7 @@ def render_views(cfg, scene_gaussian, image_rendered_dirpath, views_info_list, c
     background = torch.tensor(bg_color, dtype=torch.float32, device=device)
     bg = torch.rand((3), device=device) if cfg.random_background else background
     dataset = SceneDataset(views_info_list, cfg.image_scale, cfg.scene_scale)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=4, drop_last=False)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0, drop_last=False)
 
     for idx, view_info in enumerate(tqdm(dataloader, desc="Rendering")):
         extrinsic = view_info["extrinsic"].squeeze(0).to(device)

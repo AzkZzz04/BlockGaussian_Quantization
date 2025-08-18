@@ -44,12 +44,15 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
     background = torch.tensor(bg_color, dtype=torch.float32, device=device)
     bg = torch.rand((3), device=device) if cfg.random_background else background
 
-    # setting block optimization hyper params
+    # setting block optimization hyper params - only set if not already defined in config
     num_views = len(views_info_list)
     # cfg.iterations = min(num_views*150, cfg.iterations)
-    cfg.position_lr_max_steps = cfg.iterations
-    cfg.densify_until_iter = cfg.iterations // 2
-    cfg.opacity_reset_interval = max(cfg.iterations//10, 3000)
+    if not hasattr(cfg, 'position_lr_max_steps'):
+        cfg.position_lr_max_steps = cfg.iterations
+    if not hasattr(cfg, 'densify_until_iter'):
+        cfg.densify_until_iter = cfg.iterations // 2
+    if not hasattr(cfg, 'opacity_reset_interval'):
+        cfg.opacity_reset_interval = max(cfg.iterations//10, 3000)
     save_cfg(cfg, block_id)
 
     # scene_dataset defination

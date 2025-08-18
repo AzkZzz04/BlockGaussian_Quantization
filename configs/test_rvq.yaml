@@ -1,0 +1,63 @@
+# Test configuration for Residual Vector Quantization
+# 测试残差向量量化的配置文件
+
+# Scene settings
+scene_dirpath: "data/test_scene"
+output_dirpath: "output/test_rvq"
+
+# Gaussian Splatting settings
+sh_degree: 3
+iterations: 5000
+batch_size: 1
+num_workers: 4
+image_scale: 1.0
+scene_scale: 1.0
+white_background: false
+random_background: false
+preload: false
+
+# Training parameters
+position_lr_init: 0.00016
+position_lr_final: 0.0000016
+position_lr_delay_mult: 0.01
+position_lr_max_steps: 5000
+feature_lr: 0.0025
+opacity_lr: 0.025
+scaling_lr: 0.005
+rotation_lr: 0.001
+percent_dense: 0.01
+
+# Loss weights
+lambda_dssim: 0.2
+depth_inv_loss: false
+depth_l1_weight_init: 0.0
+depth_l1_weight_final: 0.0
+pseudo_loss: false
+pseudo_loss_start: 500
+reproj_l1_weight_init: 0.0
+reproj_l1_weight_final: 0.0
+
+# Densification
+densify_from_iter: 500
+densify_until_iter: 2500
+densification_interval: 100
+opacity_reset_interval: 3000
+densify_grad_threshold: 0.0002
+min_opacity: 0.005
+densify_only_in_block: true
+
+# VQ settings - Unified RVQ (layers=1 equals K-Means)
+rvq_layers: 2            # 2层残差VQ (设置为1等价于K-Means)
+vq_mode: "online"        # 训练中使用量化
+quant_params: ["sh", "dc"]
+
+# VQ parameters
+kmeans_st_iter: 1000     # 从第1000次迭代开始量化
+kmeans_freq: 500         # 每500次迭代重新分配
+kmeans_ncls_sh: 4096     # SH特征的目标聚类数
+kmeans_ncls_dc: 4096     # DC特征的目标聚类数
+kmeans_iters: 10         # K-Means迭代次数
+# kmeans_max_samples removed - uses full data for optimal initialization
+
+# Evaluation
+evaluate: false 

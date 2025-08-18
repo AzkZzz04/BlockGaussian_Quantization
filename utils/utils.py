@@ -19,6 +19,16 @@ def parse_cfg(args) -> easydict.EasyDict:
         cfg = yaml.load(f, Loader=yaml.FullLoader)
         if hasattr(args, "scene_dirpath") and args.scene_dirpath is not None: cfg["scene_dirpath"] = args.scene_dirpath 
         if hasattr(args, "output_dirpath") and args.output_dirpath is not None: cfg["output_dirpath"] = args.output_dirpath
+    
+    # Convert string "None" to Python None for specific parameters
+    none_params = ['position_lr_max_steps', 'densify_until_iter', 'opacity_reset_interval', 
+                   'densify_from_iter', 'densification_interval', 'densify_grad_threshold', 
+                   'min_opacity', 'densify_only_in_block', 'feature_lr', 'opacity_lr', 
+                   'scaling_lr', 'rotation_lr']
+    for param in none_params:
+        if param in cfg and cfg[param] == "None":
+            cfg[param] = None
+    
     cfg = easydict.EasyDict(cfg)
 
     if not os.path.exists(cfg.scene_dirpath):

@@ -11,6 +11,14 @@ from utils.image_utils import psnr
 from utils.loss_utils import ssim
 import torchvision.transforms.functional as tf
 
+def find_gt_image(gt_dirpath, image_name):
+    base_name = os.path.splitext(image_name)[0]
+    for ext in ['.png', '.jpg', '.jpeg', '.JPG']:
+        candidate = os.path.join(gt_dirpath, base_name + ext)
+        if os.path.exists(candidate):
+            return candidate
+    raise FileNotFoundError(f"Ground truth image not found for {image_name} in {gt_dirpath}")
+
 
 def evaluate(scene_dirpath, output_dirpath, split, result_dirname="render", train_eval_split=False):
     render_dirpath = os.path.join(output_dirpath, result_dirname, split, "rendered")
@@ -24,7 +32,7 @@ def evaluate(scene_dirpath, output_dirpath, split, result_dirname="render", trai
 
     for image_name in tqdm(sorted(os.listdir(render_dirpath)), desc="Evaluating"):
         image_render = Image.open(os.path.join(render_dirpath, image_name))
-        image_gt = Image.open(os.path.join(gt_dirpath, image_name.replace("png", "jpg")))
+        image_gt = Image.open(find_gt_image(gt_dirpath, image_name))
         if image_render.width != image_gt.width:
             image_gt = image_gt.resize((image_render.width, image_render.height))
         image_render = tf.to_tensor(image_render).unsqueeze(0)[:, :3, :, :].cuda()

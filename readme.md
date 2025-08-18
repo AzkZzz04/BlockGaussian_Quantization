@@ -271,3 +271,18 @@ If you find this code useful for your research, please use the following BibTeX 
       url={https://arxiv.org/abs/2504.09048}, 
 }
 ```
+
+## Acknowledgements
+
+This work is built upon the official implementation of "3D Gaussian Splatting for Real-Time Radiance Field Rendering".
+
+The Vector Quantization implementation is inspired by "CompGS: Smaller and Faster Gaussian Splatting with Vector Quantization". If you use the CompGS-style quantization feature, please consider citing their work:
+
+```bibtex
+@article{navaneet2023compact3d,
+  title={CompGS: Smaller and Faster Gaussian Splatting with Vector Quantization},
+  author={Navaneet, KL and Meibodi, Kossar Pourahmadi and Koohpayegani, Soroush Abbasi and Pirsiavash, Hamed},
+  journal={ECCV},
+  year={2024}
+}
+```

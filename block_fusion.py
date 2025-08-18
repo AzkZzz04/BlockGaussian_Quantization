@@ -76,12 +76,12 @@ def merge_blocks(sh_degree, ply_filepaths, merged_plypath):
         scales_all.append(scales)
         rots_all.append(rots)
     
-    xyz_all = np.concat(xyz_all, axis=0)
-    features_dc_all = np.concat(features_dc_all, axis=0)
-    features_extra_all = np.concat(features_extra_all, axis=0)
-    opacities_all = np.concat(opacities_all, axis=0)
-    scales_all = np.concat(scales_all, axis=0)
-    rots_all = np.concat(rots_all, axis=0)
+    xyz_all = np.concatenate(xyz_all, axis=0)
+    features_dc_all = np.concatenate(features_dc_all, axis=0)
+    features_extra_all = np.concatenate(features_extra_all, axis=0)
+    opacities_all = np.concatenate(opacities_all, axis=0)
+    scales_all = np.concatenate(scales_all, axis=0)
+    rots_all = np.concatenate(rots_all, axis=0)
 
     print("Num points of merged scene pcd:", xyz_all.shape[0])
     save_gs_ply(merged_plypath, xyz_all, features_dc_all, features_extra_all, opacities_all, scales_all, rots_all)

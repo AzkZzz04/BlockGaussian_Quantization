@@ -2,4 +2,70 @@ datasets
 **/__pycache__
 __pycache__
 .vscode
+.idea/
 preprocess/Depth-Anything-V2/checkpoints
+
+# Python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ML/Data
+*.ckpt
+*.pth
+*.pt
+checkpoints/
+logs/
+wandb/
+output/
+*.ply
+*.npz
+
+# Large files and datasets
+*.zip
+*.tar.gz
+*.7z
+*.rar
+UrbanScene3D-Dataset/
+datasets/
+data/
+*.bin
+*.dat
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints
+
+# Environment
+.env
+.venv
+env/
+venv/

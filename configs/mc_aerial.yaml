@@ -1,6 +1,6 @@
 # scene params
-scene_dirpath: ./datasets/matrixcity/aerial/train
-output_dirpath: ./output/mc_aerial
+scene_dirpath: ./datasets/matrixcity/aerial/train/block_all
+output_dirpath: ./output/mc_aerial_test
 white_background: false
 sh_degree: 3
 evaluate: false
@@ -13,10 +13,10 @@ num_points_thresh: 300000
 cover_ratio_thresh: 0.3
 
 # training params
-num_workers: 8
+num_workers: 0
 batch_size: 1
 preload: "cpu" # "cpu" / "none"
-iterations: 40000
+iterations: 20000
 position_lr_init: 0.00016
 position_lr_final: 0.0000016
 position_lr_delay_mult: 0.01

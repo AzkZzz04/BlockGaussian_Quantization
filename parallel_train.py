@@ -1,6 +1,7 @@
 import time
 import argparse
 import subprocess
+import os
 
 
 def get_gpu_memory_usage():
@@ -14,13 +15,16 @@ def get_gpu_memory_usage():
 
 def is_gpu_available(gpu_id):
     memory_usage = get_gpu_memory_usage()
+    print(f"GPU {gpu_id} memory usage: {memory_usage[gpu_id]} MB (threshold {memory_threshold})")
     return memory_usage[gpu_id] < memory_threshold
 
 
 def run_task_on_gpu(gpu_id, task_id):
-    command = base_command.format(gpu_id, task_id)
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    command = ['python', 'train.py', '-c', args.config, '-b', str(task_id)]
     print(f"Running task {task_id} on GPU {gpu_id}: ", command)
-    process = subprocess.Popen(command, shell=True)
+    process = subprocess.Popen(command, env=env)
     gpu_tasks[gpu_id] = (task_id, process)
 
 
@@ -55,7 +59,7 @@ if __name__ == "__main__":
     parser.add_argument("--config", "-c", type=str, default="./configs/rubble.yaml", help="config filepath")
     parser.add_argument("--num_blocks", type=int, default=1, help="Number of blocks to run")
     parser.add_argument("--num_gpus", type=int, default=8, help="Number of GPUs available")
-    parser.add_argument("--memory_threshold", type=int, default=2048, help="GPU memory threshold in MB")
+    parser.add_argument("--memory_threshold", type=int, default=4096*2, help="GPU memory threshold in MB")
     args = parser.parse_args()
 
     num_blocks = args.num_blocks
@@ -65,7 +69,9 @@ if __name__ == "__main__":
 
     global gpu_tasks, base_command
     gpu_tasks = {gpu_id: None for gpu_id in range(num_gpus)}
-    base_command = "CUDA_VISIBLE_DEVICES={} python train.py" + " -c " + args.config + " -b {} "
+    base_command = 'cmd /c "set CUDA_VISIBLE_DEVICES={} && python train.py -c ' + args.config + ' -b {}"'
+
+    print("CUDA_VISIBLE_DEVICES:", os.environ.get("CUDA_VISIBLE_DEVICES"))
 
     check_and_launch_tasks()
     wait_for_all_tasks_to_complete()
