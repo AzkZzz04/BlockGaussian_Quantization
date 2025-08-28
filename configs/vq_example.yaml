@@ -18,7 +18,7 @@ cover_ratio_thresh: 0.3
 num_workers: 0
 batch_size: 1
 preload: "cpu" # "cpu" / "none"
-iterations: 20000
+iterations: 5000
 
 position_lr_init: 0.00016
 position_lr_final: 0.0000016
@@ -82,17 +82,20 @@ rvq_layers: 2                 # RVQ层数: 1=K-Means等价, 2+=真正的残差VQ
 vq_mode: 'online'             # online: 训练中使用量化; export: 仅导出时量化
 
 # VQ时机和频率控制
-kmeans_st_iter: 10000         # 开始VQ的迭代次数 (建议在训练中期开始)
-kmeans_freq: 100              # 重新分配频率(仅online模式, 建议100-500)
+kmeans_st_iter: 1000          # 开始VQ的迭代次数 (建议在训练中期开始)
+kmeans_freq: 200              # 重新分配频率(仅online模式, 建议100-500)
 
 # VQ质量参数
-kmeans_ncls_sh: 2048          # SH特征的目标聚类数 (影响颜色精度)
-kmeans_ncls_dc: 1024          # DC特征的目标聚类数 (影响基础颜色)
-kmeans_iters: 10              # 每层K-Means迭代次数 (10通常足够)
+kmeans_ncls_sh: 1024          # SH特征的目标聚类数 (影响颜色精度)
+kmeans_ncls_dc: 512          # DC特征的目标聚类数 (影响基础颜色)
+kmeans_iters: 5              # 每层K-Means迭代次数 (10通常足够)
 
 # 新特性开关
 sh_band_weighting: true       # 启用SH频带重加权 (改善高频保持，推荐启用)
 band_weight_alpha: 0.15       # 频带权重强度 (0.1-0.2, 越大高频权重越高)
 layer_aware_training: true    # 启用层间感知对齐 (后层更注重感知质量)
+
+# IndexPrior配置 (禁用IndexPrior)
+use_index_prior: false        # 禁用IndexPrior功能，使用标准RVQ训练
 
 # kmeans_max_samples removed - now always uses full data for optimal K-Means++ initialization

@@ -5,16 +5,15 @@ import shutil
 import random
 import argparse
 
-import cv2
 import torch
 import numpy as np
 from tqdm import tqdm
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter 
 
 from gaussian_renderer import render
 from utils.image_utils import psnr
 from utils.general_utils import get_expon_lr_func
-from utils.loss_utils import l1_loss, ssim, src2ref, loss_reproj
+from utils.loss_utils import l1_loss, ssim, src2ref
 from scene.cameras import get_render_camera
 from scene.gaussian_model import GaussianModel
 from scene.scene_loader import SceneDataset, Scene
@@ -24,7 +23,7 @@ from utils.utils import parse_cfg, cal_local_cam_extent, save_cfg, read_pcdfile
 try:
     from fused_ssim import fused_ssim
     FUSED_SSIM_AVAILABLE = True
-except:
+except Exception:
     FUSED_SSIM_AVAILABLE = False
 
 
@@ -39,43 +38,61 @@ torch.cuda.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 
 
-def save_vq_results(kmeans_quantizers, quantized_params, out_dir):
-    """Save RVQ results using unified approach."""
-    os.makedirs(out_dir, exist_ok=True)
+def save_vq_results(vq_quantizers_dict: dict, out_dir: str):
+    """Save RVQ/K-Means artifacts from a dict of per-param quantizers.
 
-    # Use the RVQ I/O system (works for both single and multi-layer)
-    from scene.residual_vq import save_rvq_artifacts
-    
+    Each quantizer is expected to implement at least:
+      - get_codebooks() -> List[Tensor(K_l, D)]
+      - get_all_indices() -> List[LongTensor(N)] or (layers, N)
+
+    Args:
+        vq_quantizers_dict: {'dc': Quantize_RVQ, 'sh': Quantize_RVQ, ...}
+        out_dir: output directory
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        # unified persistence function in your project
+        from scene.residual_vq import save_rvq_artifacts
+    except Exception as e:
+        print(f"⚠️  save_rvq_artifacts not found: {e}")
+        return
+
     codebooks_dict = {}
     indices_dict = {}
-    
-    for param in quantized_params:
-        if param in kmeans_quantizers:
-            q = kmeans_quantizers[param]
-            if hasattr(q, 'get_codebooks') and hasattr(q, 'get_all_level_indices'):
-                codebooks = q.get_codebooks()
-                all_indices = q.get_all_level_indices()
-                if codebooks and len(codebooks) > 0:
-                    codebooks_dict[param] = codebooks
-                if all_indices and len(all_indices) > 0:
-                    indices_dict[param] = all_indices
-    
-    if codebooks_dict:
-        # Determine if single layer (K-Means equivalent) or multi-layer RVQ
-        is_single_layer = all(len(cb) == 1 for cb in codebooks_dict.values())
-        vq_type_name = "K-Means" if is_single_layer else "Residual VQ"
-        
-        manifest_meta = {
-            'quantized_params': quantized_params,
-            'vq_type': vq_type_name.lower().replace('-', '_'),
-            'layers_per_param': {p: len(codebooks_dict[p]) for p in codebooks_dict.keys()}
-        }
-        paths = save_rvq_artifacts(out_dir, codebooks_dict, indices_dict, manifest_meta)
-        print(f"💾 {vq_type_name} results saved to {out_dir}")
-        for key, path in paths.items():
-            print(f"   • {key}: {os.path.basename(path)}")
-    else:
-        print(f"⚠️  No VQ codebooks to save")
+    layers_per_param = {}
+
+    for param_name, quantizer in vq_quantizers_dict.items():
+        try:
+            cbs = quantizer.get_codebooks()
+            ids = quantizer.get_all_indices()
+        except AttributeError as e:
+            print(f"⚠️  Quantizer for '{param_name}' lacks methods: {e}")
+            continue
+        if cbs is None or len(cbs) == 0:
+            continue
+
+        codebooks_dict[param_name] = cbs
+        indices_dict[param_name] = ids
+        layers_per_param[param_name] = len(cbs)
+
+    if not codebooks_dict:
+        print("⚠️  No VQ artifacts to save (empty dict).")
+        return
+
+    is_single_layer = all(n == 1 for n in layers_per_param.values())
+    vq_type_name = "k_means" if is_single_layer else "residual_vq"
+
+    manifest_meta = {
+        'quantized_params': list(codebooks_dict.keys()),
+        'vq_type': vq_type_name,
+        'layers_per_param': layers_per_param
+    }
+
+    paths = save_rvq_artifacts(out_dir, codebooks_dict, indices_dict, manifest_meta)
+    print(f"💾 VQ artifacts saved to {out_dir}")
+    for key, path in paths.items():
+        print(f"   • {key}: {os.path.basename(path)}")
+
 
 @torch.no_grad()
 def eval_metrics(local_gaussian,
@@ -90,15 +107,14 @@ def eval_metrics(local_gaussian,
                  save_dir=None,
                  prefix="Final"):
     """
-    评估 PSNR / SSIM / LPIPS（可选），自动选择评估照片并打印+保存结果。
-
-    选择逻辑：
-      - 若提供 eval_views_info 且非空 → 全部评估
-      - 否则 → 从 train_views_info_list 随机抽 sample_k 张（默认20）
+    Evaluate PSNR/SSIM/LPIPS (optional), automatically select evaluation images and print+save results.
+    Selection logic:
+      - If eval_views_info provided and non-empty → evaluate all
+      - Otherwise → randomly sample sample_k from train_views_info_list
     """
     import random
 
-    # 1) 选择评估照片（视角）
+    # 1) select evaluation images (views)
     if eval_views_info is not None and len(eval_views_info) > 0:
         selected_views = list(eval_views_info)
         select_src = f"validation ({len(selected_views)} views)"
@@ -111,7 +127,7 @@ def eval_metrics(local_gaussian,
         max_images = len(selected_views)
     max_images = min(max_images, len(selected_views))
 
-    # 2) 构建只读 DataLoader
+    # 2) build read-only DataLoader
     dataset = SceneDataset(
         selected_views,
         cfg.image_scale if use_eval_scale else 1.0,
@@ -120,7 +136,7 @@ def eval_metrics(local_gaussian,
     loader = torch.utils.data.DataLoader(dataset, batch_size=1, shuffle=False,
                                          num_workers=cfg.num_workers, drop_last=False)
 
-    # 3) LPIPS（可选）
+    # 3) LPIPS (optional)
     lpips_fn = None
     try:
         import lpips
@@ -128,7 +144,7 @@ def eval_metrics(local_gaussian,
     except Exception:
         pass
 
-    # 4) 逐张累积指标
+    # 4) accumulate metrics per image
     psnr_sum, ssim_sum, lpips_sum, n = 0.0, 0.0, 0.0, 0
     for i, vinfo in enumerate(loader):
         if i >= max_images:
@@ -155,7 +171,7 @@ def eval_metrics(local_gaussian,
             ssim_val = ssim(img_r, image_gt).item()
         ssim_sum += ssim_val
 
-        # LPIPS（若可用）
+        # LPIPS (if available)
         if lpips_fn is not None:
             lp = lpips_fn(img_r.unsqueeze(0) * 2 - 1, image_gt.unsqueeze(0) * 2 - 1)
             lpips_sum += float(lp.mean().item())
@@ -170,7 +186,7 @@ def eval_metrics(local_gaussian,
         "source": select_src
     }
 
-    # 打印结果
+    # print results
     print(f"\n=== {prefix} Metrics ===")
     print(f"Source: {metrics['source']}")
     print(f"Images evaluated: {metrics['N']}")
@@ -181,9 +197,8 @@ def eval_metrics(local_gaussian,
     else:
         print("LPIPS: (skipped, install `lpips` to enable)")
 
-    # 保存 JSON（可选）
+    # save JSON (optional)
     if save_dir is not None:
-        import os, json
         os.makedirs(save_dir, exist_ok=True)
         out_path = os.path.join(save_dir, f"{prefix.lower()}_metrics.json")
         try:
@@ -195,9 +210,10 @@ def eval_metrics(local_gaussian,
 
     return metrics
 
+
 def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval_views_info=None, device=torch.device("cuda")):
     block_bbx = block_bbx_expand
-    tb_writer = None  # 想开 TensorBoard 可用：SummaryWriter(cfg.output_dirpath)
+    tb_writer = None  # For TensorBoard, can use: SummaryWriter(cfg.output_dirpath)
 
     print(f"Reconstructing block {block_id}, Num block views: {len(views_info_list)}")
     point_cloud_path = os.path.join(cfg.output_dirpath, "point_cloud")
@@ -236,7 +252,7 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
         cfg.min_opacity = 0.005
     if not hasattr(cfg, 'densify_only_in_block') or cfg.densify_only_in_block is None:
         cfg.densify_only_in_block = True
-    
+
     # Learning rate params - set defaults if None (like train.py)
     if not hasattr(cfg, 'feature_lr') or cfg.feature_lr is None:
         cfg.feature_lr = 0.0025
@@ -257,83 +273,127 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
     depth_l1_weight = get_expon_lr_func(cfg.depth_l1_weight_init, cfg.depth_l1_weight_final, max_steps=cfg.iterations)
     reproj_l1_weight = get_expon_lr_func(cfg.reproj_l1_weight_init, cfg.reproj_l1_weight_final, max_steps=cfg.iterations)
 
-    # VQ config
-    vq_enabled = hasattr(cfg, 'quant_params') or hasattr(cfg, 'kmeans_ncls_sh') or hasattr(cfg, 'kmeans_ncls_dc')
+    # VQ config - RVQ enabled by default
+    def get_config(key, default):
+        return getattr(cfg, key, default)
+
+    quantized_params = get_config('quant_params', ['sh', 'dc'])
+    rvq_layers = get_config('rvq_layers', 2)  # default uses RVQ
+    n_cls_sh = get_config('kmeans_ncls_sh', 4096)
+    n_cls_dc = get_config('kmeans_ncls_dc', 4096)
+    n_it = get_config('kmeans_iters', 10)
+    kmeans_st_iter = get_config('kmeans_st_iter', 1000)
+    freq_cls_assn = get_config('kmeans_freq', 500)
+
+    # IndexPrior configuration
+    use_index_prior = get_config('use_index_prior', False)
+    index_prior_config = {
+        'd_model': get_config('index_prior_d_model', 64),
+        'nhead': get_config('index_prior_nhead', 8),
+        'num_layers': get_config('index_prior_num_layers', 2),
+        'use_positional_encoding': get_config('index_prior_use_pos_enc', True)
+    }
     
-    if vq_enabled:
-        quantized_params = cfg.quant_params if hasattr(cfg, 'quant_params') else ['sh', 'dc']
-        rvq_layers = cfg.rvq_layers if hasattr(cfg, 'rvq_layers') else 2
-        n_cls_sh = cfg.kmeans_ncls_sh if hasattr(cfg, 'kmeans_ncls_sh') else 4096
-        n_cls_dc = cfg.kmeans_ncls_dc if hasattr(cfg, 'kmeans_ncls_dc') else 4096
-        n_it = cfg.kmeans_iters if hasattr(cfg, 'kmeans_iters') else 10
-        kmeans_st_iter = cfg.kmeans_st_iter if hasattr(cfg, 'kmeans_st_iter') else 1000
-        freq_cls_assn = cfg.kmeans_freq if hasattr(cfg, 'kmeans_freq') else 500
-        vq_mode = cfg.vq_mode if hasattr(cfg, 'vq_mode') else 'online'
-        # max_samples parameter removed - now uses full data for optimal K-Means++ init
-    else:
-        quantized_params = []
-        rvq_layers = 1
-        n_cls_sh = 0
-        n_cls_dc = 0
-        n_it = 0
-        kmeans_st_iter = float('inf')
-        freq_cls_assn = float('inf')
-        vq_mode = 'disabled'
-        # max_samples parameter removed - K-Means uses full data
+    # IndexPrior model loading
+    index_priors = None
+    if use_index_prior:
+        prior_ckpt_dir = get_config('index_prior_ckpt_dir', None)
+        if prior_ckpt_dir and os.path.exists(prior_ckpt_dir):
+            try:
+                from scripts.load_index_prior import load_priors
+                vocab_size = max(n_cls_sh, n_cls_dc)  # use maximum vocabulary size
+                index_priors = load_priors(
+                    prior_ckpt_dir=prior_ckpt_dir,
+                    layers=rvq_layers,
+                    vocab=vocab_size,
+                    device='cuda'
+                )
+                print(f"✅ Loaded IndexPrior models from {prior_ckpt_dir}")
+            except Exception as e:
+                print(f"⚠️  Failed to load IndexPrior models: {e}")
+                print("   Continuing without IndexPrior...")
+                index_priors = None
+        else:
+            print("⚠️  IndexPrior enabled but no checkpoint directory provided")
+            print("   Continuing without pre-trained IndexPrior...")
 
-    if vq_enabled:
-        print("\n" + "=" * 60)
-        print(f"🚀 VQ CONFIGURATION FOR BLOCK {block_id}")
-        print("=" * 60)
-        print("📋 VQ Parameters:")
-        vq_type_name = "K-Means" if rvq_layers == 1 else "Residual VQ"
-        print(f"   • Type: {vq_type_name}")
-        print(f"   • RVQ Layers: {rvq_layers}")
-        print(f"   • Mode: {vq_mode}  (online: 训练中用量化渲染 / export: 仅导出前量化)")
-        print(f"   • Quantized Parameters: {quantized_params}")
-        print(f"   • SH Clusters: {n_cls_sh}")
-        print(f"   • DC Clusters: {n_cls_dc}")
-        print(f"   • k-means Iterations: {n_it}")
-        print(f"   • k-means Start Iteration: {kmeans_st_iter}")
-        print(f"   • Cluster Assignment Frequency: {freq_cls_assn}")
-        print(f"   • K-Means Initialization: Full data (no sampling)")
-        print("=" * 60 + "\n")
-    else:
-        print(f"\n[INFO] VQ disabled for block {block_id} - running in standard mode (like train.py)")
+    print("\n" + "=" * 60)
+    print(f"🚀 RVQ CONFIGURATION FOR BLOCK {block_id}")
+    print("=" * 60)
+    print("📋 RVQ Parameters:")
+    vq_type_name = "K-Means" if rvq_layers == 1 else "Residual VQ"
+    print(f"   • Type: {vq_type_name}")
+    print(f"   • RVQ Layers: {rvq_layers}")
+    print(f"   • Quantized Parameters: {quantized_params}")
+    print(f"   • SH Clusters: {n_cls_sh}")
+    print(f"   • DC Clusters: {n_cls_dc}")
+    print(f"   • k-means Iterations: {n_it}")
+    print(f"   • k-means Start Iteration: {kmeans_st_iter}")
+    print(f"   • Cluster Assignment Frequency: {freq_cls_assn}")
+    print(f"   • K-Means Initialization: Full data (no sampling)")
+    if use_index_prior:
+        print("🔮 IndexPrior Configuration:")
+        print(f"   • Enabled: {use_index_prior}")
+        print(f"   • Model Dimension: {index_prior_config['d_model']}")
+        print(f"   • Attention Heads: {index_prior_config['nhead']}")
+        print(f"   • Transformer Layers: {index_prior_config['num_layers']}")
+        print(f"   • Positional Encoding: {index_prior_config['use_positional_encoding']}")
+    print("=" * 60 + "\n")
 
-    # VQ quantizers (unified RVQ approach)
+    # RVQ quantizers
     kmeans_quantizers = {}
-    if vq_enabled and 'dc' in quantized_params:
-        # 获取层间感知和频带重加权参数
-        sh_band_weighting = getattr(cfg, 'sh_band_weighting', True)
-        band_weight_alpha = getattr(cfg, 'band_weight_alpha', 0.15)
-        layer_aware_training = getattr(cfg, 'layer_aware_training', True)
-        
+
+    # get common parameters
+    sh_band_weighting = get_config('sh_band_weighting', True)
+    band_weight_alpha = get_config('band_weight_alpha', 0.15)
+    layer_aware_training = get_config('layer_aware_training', True)
+
+    if 'dc' in quantized_params:
         kmeans_quantizers['dc'] = Quantize_RVQ(
-            which='dc', 
-            target_k=n_cls_dc, 
-            layers=rvq_layers, 
+            which='dc',
+            target_k=n_cls_dc,
+            layers=rvq_layers,
             num_iters=n_it,
-            sh_band_weighting=False,  # DC不使用频带重加权
+            sh_band_weighting=False,  # DC doesn't use band weighting
             band_weight_alpha=band_weight_alpha,
-            layer_aware_training=layer_aware_training
+            layer_aware_training=layer_aware_training,
+            use_index_prior=use_index_prior,
+            index_prior_config=index_prior_config
         )
-    
-    if vq_enabled and 'sh' in quantized_params:
-        # 获取层间感知和频带重加权参数
-        sh_band_weighting = getattr(cfg, 'sh_band_weighting', True)
-        band_weight_alpha = getattr(cfg, 'band_weight_alpha', 0.15)
-        layer_aware_training = getattr(cfg, 'layer_aware_training', True)
-        
+        # inject pre-trained IndexPrior models
+        if index_priors is not None:
+            kmeans_quantizers['dc']._rvq.set_index_priors(index_priors)
+
+    if 'sh' in quantized_params:
         kmeans_quantizers['sh'] = Quantize_RVQ(
-            which='sh', 
-            target_k=n_cls_sh, 
-            layers=rvq_layers, 
+            which='sh',
+            target_k=n_cls_sh,
+            layers=rvq_layers,
             num_iters=n_it,
-            sh_band_weighting=sh_band_weighting,  # SH使用频带重加权
+            sh_band_weighting=sh_band_weighting,  # SH uses band weighting
             band_weight_alpha=band_weight_alpha,
-            layer_aware_training=layer_aware_training
+            layer_aware_training=layer_aware_training,
+            use_index_prior=use_index_prior,
+            index_prior_config=index_prior_config
         )
+        # inject pre-trained IndexPrior models
+        if index_priors is not None:
+            kmeans_quantizers['sh']._rvq.set_index_priors(index_priors)
+
+    # pre-compute reassignment iterations to avoid boolean checks every iteration
+    reassign_iterations = set()
+    # first assignment
+    reassign_iterations.add(kmeans_st_iter + 1)
+    # periodic reassignment
+    for i in range(kmeans_st_iter + 1, cfg.iterations + 1, freq_cls_assn):
+        reassign_iterations.add(i)
+
+    # pre-compute layer-aware training enable iterations
+    layer_aware_iterations = set()
+    if layer_aware_training:
+        for i in reassign_iterations:
+            if i > kmeans_st_iter + 1000:  # enable condition: assign and past warm-up
+                layer_aware_iterations.add(i)
 
     # Timer
     start_time = time.time()
@@ -348,10 +408,10 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
         if iteration % 1000 == 0:
             local_gaussian.oneupSHdegree()
 
-        # -------- VQ online --------
-        # VQ启动前的预评估 (重要基线)
-        if vq_enabled and vq_mode == 'online' and iteration == kmeans_st_iter:
-            print(f"\n📊 PRE-VQ BASELINE EVALUATION (Iteration {iteration})")
+        # -------- RVQ online --------
+        # Pre-RVQ baseline evaluation (important baseline)
+        if iteration == kmeans_st_iter:
+            print(f"\n📊 PRE-RVQ BASELINE EVALUATION (Iteration {iteration})")
             print("=" * 60)
             eval_metrics(
                 local_gaussian,
@@ -360,82 +420,32 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                 bg=bg,
                 device=device,
                 eval_views_info=eval_views_info,
-                sample_k=50,  # 更详细的基线评估
+                sample_k=50,
                 max_images=None,
-                save_dir=cfg.output_dirpath,
-                prefix=f"Block_{block_id}_PreVQ_Baseline"
+                save_dir=os.path.join(point_cloud_path, str(block_id)),
+                prefix=f"Block_{block_id}_PreRVQ_Baseline"
             )
             print("=" * 60)
 
-        if vq_enabled and vq_mode == 'online' and iteration >= kmeans_st_iter:
-            assign = (iteration == kmeans_st_iter + 1) or (iteration % freq_cls_assn == 1)
-            
-            # Layer-aware training: enable during assignment iterations
-            layer_aware_enabled = assign and iteration > kmeans_st_iter + 1000  # 启用条件：assign且过了warm-up
-            
-            if 'dc' in kmeans_quantizers:
-                if layer_aware_enabled:
-                    kmeans_quantizers['dc'].enable_layer_aware_training(True)
-                kmeans_quantizers['dc'].forward_dc(local_gaussian, assign=assign)
-                if layer_aware_enabled:
-                    kmeans_quantizers['dc'].enable_layer_aware_training(False)
-                    
-            if 'sh' in kmeans_quantizers:
-                if layer_aware_enabled:
-                    kmeans_quantizers['sh'].enable_layer_aware_training(True)
-                kmeans_quantizers['sh'].forward_frest(local_gaussian, assign=assign)
-                if layer_aware_enabled:
-                    kmeans_quantizers['sh'].enable_layer_aware_training(False)
-            
-            # VQ首次启动后的评估
-            if assign and iteration == kmeans_st_iter + 1:
-                print(f"\n🎯 POST-VQ INITIAL EVALUATION (Iteration {iteration})")
-                print("=" * 60)
-                eval_metrics(
-                    local_gaussian,
-                    train_views_info_list=views_info_list,
-                    cfg=cfg,
-                    bg=bg,
-                    device=device,
-                    eval_views_info=eval_views_info,
-                    sample_k=30,
-                    max_images=15,
-                    save_dir=cfg.output_dirpath,
-                    prefix=f"Block_{block_id}_PostVQ_Initial"
-                )
-                print("=" * 60)
-            
-            # 每1000轮打印层损失统计
-            if layer_aware_enabled and iteration % 1000 == 0:
-                for param_name, quantizer in kmeans_quantizers.items():
-                    stats = quantizer.get_layer_loss_stats()
-                    if stats:
-                        print(f"[Layer-Aware {param_name.upper()}] Layer loss stats:")
-                        for layer_name, layer_stat in stats.items():
-                            print(f"  {layer_name}: mean={layer_stat['mean']:.4f}, count={layer_stat['count']}")
-                            
-                # 层间感知启用后的评估
-                if iteration == kmeans_st_iter + 1000:
-                    print(f"\n🧠 LAYER-AWARE TRAINING EVALUATION (Iteration {iteration})")
-                    print("=" * 60)
-                    eval_metrics(
-                        local_gaussian,
-                        train_views_info_list=views_info_list,
-                        cfg=cfg,
-                        bg=bg,
-                        device=device,
-                        eval_views_info=eval_views_info,
-                        sample_k=30,
-                        max_images=15,
-                        save_dir=cfg.output_dirpath,
-                        prefix=f"Block_{block_id}_LayerAware_Start"
-                    )
-                    print("=" * 60)
+        # RVQ logic: online mode quantizes during training; export mode skips online quantization
+        if cfg.vq_mode == 'online' and iteration >= kmeans_st_iter:
+            assign = iteration in reassign_iterations
+            layer_aware_enabled = iteration in layer_aware_iterations
 
-        # export mode hint
-        if vq_enabled and vq_mode == 'export' and iteration % 200 == 0:
-            remaining = max(kmeans_st_iter - iteration, 0)
-            print(f"[VQ(export)] Will quantize only at export. Start threshold unused here. Remaining ~{remaining} iters.")
+            # Simplified quantizer management
+            for param_name, quantizer in kmeans_quantizers.items():
+                if layer_aware_enabled:
+                    quantizer.enable_layer_aware_training(True)
+
+                if param_name == 'dc':
+                    quantizer.forward_dc(local_gaussian, assign=assign)
+                elif param_name == 'sh':
+                    quantizer.forward_frest(local_gaussian, assign=assign)
+
+                if layer_aware_enabled:
+                    quantizer.enable_layer_aware_training(False)
+
+            # Disable mid-training evaluation (only keep pre-RVQ and final evaluation)
 
         batch_sample_num = view_info["extrinsic"].shape[0]
 
@@ -444,6 +454,13 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
         densify_cache = []
         finite_batch = True
         loss_total_val = 0.0
+
+        # Read pseudo configuration (compatible with old spelling), default off
+        def _get_cfg(cfg_obj, key: str, default=None):
+            return getattr(cfg_obj, key, default)
+
+        use_pseudo = bool(_get_cfg(cfg, 'pseudo_loss', _get_cfg(cfg, 'pesudo_loss', False)))
+        pseudo_start = int(_get_cfg(cfg, 'pseudo_loss_start', _get_cfg(cfg, 'pesudo_loss_start', 10_000)))
 
         for sample_idx in range(batch_sample_num):
             extrinsic = view_info["extrinsic"][sample_idx].to(device)
@@ -464,31 +481,28 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                 ssim_value = ssim(image_rendered, image_gt)
             loss_photo = (1.0 - cfg.lambda_dssim) * l1_loss_photo + cfg.lambda_dssim * (1.0 - ssim_value)
 
-            # scaling 正则（原版：体积惩罚）
+            # scaling regularization (original: volume penalty)
             sc = local_gaussian.get_scaling
             loss_scaling = (torch.clamp(sc, 0.001, 10.0) ** 2).mean()
 
-            # 基础损失
+            # basic loss
             loss = loss_photo + 0.01 * loss_scaling
 
-            # depth inverse loss（原版直接用渲染的“倒深度”）
+            # depth inverse loss (original: directly use rendered "inverse depth")
             if cfg.depth_inv_loss and not isinstance(view_info["depth_inv"][sample_idx], str):
-                depth_rendered_inv = render_pkg["depth"].squeeze(0)  # 原版：不做 clamp 直接使用
+                depth_rendered_inv = render_pkg["depth"].squeeze(0)  # original: no clamp, use directly
                 depth_gt_inv = view_info["depth_inv"][sample_idx].to(device)
                 l1_loss_depth = torch.abs(depth_gt_inv - depth_rendered_inv).mean()
                 loss = loss + depth_l1_weight(iteration) * l1_loss_depth
 
-            
-           # ---------- Reprojection loss（stable, 4 dirs: ±x/±y） ----------
-            use_pseudo = cfg.pseudo_loss if hasattr(cfg, 'pseudo_loss') else cfg.pesudo_loss
-            pseudo_start = cfg.pseudo_loss_start if hasattr(cfg, 'pseudo_loss_start') else cfg.pesudo_loss_start
+            # ---------- Reprojection loss（stable, 4 dirs: ±x/±y） ----------
             if use_pseudo and iteration > pseudo_start:
                 try:
-                    # 1) 先把深度夹紧再取倒数，避免 0/极小值
+                    # 1) First clamp depth then take inverse, avoid 0/extremely small values
                     depth_ref = torch.clamp(render_pkg["depth"].squeeze(0), 1e-6, 1e6)
                     depth_inv_ref = 1.0 / depth_ref
 
-                    # 2) 像素级扰动幅度，自适应并限幅（1px ~ 0.05*W）
+                    # 2) Pixel-level perturbation amplitude, adaptive and clamped (1px ~ 0.05*W)
                     fx = intrinsic[0, 0]
                     px_shift = 0.05 * image_width * torch.median(depth_inv_ref) / fx
                     px_shift = torch.clamp(
@@ -499,23 +513,22 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
 
                     zero = torch.tensor(0.0, device=device)
                     dirs = [
-                        torch.stack((+px_shift, zero,      zero)),   # +x（像素右移）
-                        torch.stack((-px_shift, zero,      zero)),   # -x（像素左移）
-                        torch.stack((zero,      +px_shift, zero)),   # +y（像素下移）
-                        torch.stack((zero,      -px_shift, zero)),   # -y（像素上移）
+                        torch.stack((+px_shift, zero,      zero)),   # +x
+                        torch.stack((-px_shift, zero,      zero)),   # -x
+                        torch.stack((zero,      +px_shift, zero)),   # +y
+                        torch.stack((zero,      -px_shift, zero)),   # -y
                     ]
-                    # 用 CPU 取随机索引，避免张量->Python int 的设备问题
                     dir_idx = random.randrange(4)
                     disturb = dirs[dir_idx]
 
-                    # 3) 渲染扰动视角，深度同样夹紧
+                    # 3) Render perturbed viewpoint
                     cam_src = get_render_camera(image_height, image_width, extrinsic, intrinsic, disturb=disturb)
                     pkg_src = render(cam_src, local_gaussian, cfg, bg)
                     img_src = torch.clamp(pkg_src["render"], 0.0, 1.0)
                     depth_src = torch.clamp(pkg_src["depth"].squeeze(0), 1e-6, 1e6)
                     depth_inv_src = 1.0 / depth_src
 
-                    # 4) 重投影 + 有效像素 mask
+                    # 4) Reprojection + valid pixel mask
                     reproj_depth, reproj_img = src2ref(
                         camera_render.intrinsic, camera_render.extrinsic, depth_inv_ref,
                         cam_src.intrinsic,      cam_src.extrinsic,      depth_inv_src,
@@ -529,7 +542,7 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                     )
                     valid_px = int(valid.sum().item())
 
-                    # 5) 只有足够像素才计入损失，并确保数值有限
+                    # 5) Include in loss only if sufficient pixels
                     if valid_px >= 1024:
                         diff = torch.abs(reproj_img - image_gt)
                         loss_reproj_photo = diff[valid].mean()
@@ -542,9 +555,9 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                 except Exception as e:
                     if iteration % 200 == 0:
                         print(f"[Warn] Reproj exception → skip ({e})")
-            # ---------- 重投影结束 ----------
+            # ---------- Reprojection end ----------
 
-            # 数值稳定性（可选打印）
+            # Numerical stability (optional printing)
             if not torch.isfinite(loss):
                 finite_batch = False
                 print(f"[Warn] Non-finite loss at iter {iteration}: {loss.detach().item()}")
@@ -565,7 +578,7 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
 
         if not finite_batch:
             local_gaussian.optimizer.zero_grad(set_to_none=True)
-            continue  # 跳过这个 batch 的优化与 VQ 后续
+            continue  # skip this batch's optimization and subsequent VQ
 
         # -------- Densify & Prune --------
         if iteration < cfg.densify_until_iter:
@@ -598,41 +611,8 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
             tb_writer.add_scalar(f"block_{block_id}/loss", loss_total_val, iteration)
             tb_writer.add_scalar(f"block_{block_id}/Npts", local_gaussian.get_xyz.shape[0], iteration)
 
-        # -------- Periodic PSNR --------
-        if iteration % 2000 == 0:
-            psnr_sum, n = 0.0, 0
-            for idx_eval, vinfo in enumerate(scene_dataloader):
-                if idx_eval >= 2:
-                    break
-                bsz = vinfo["extrinsic"].shape[0]
-                for s in range(bsz):
-                    extrinsic = vinfo["extrinsic"][s].to(device)
-                    intrinsic = vinfo["intrinsic"][s].to(device)
-                    H = vinfo["image_height"][s].item()
-                    W = vinfo["image_width"][s].item()
-                    image_gt = vinfo["image"][s].to(device)
-                    cam = get_render_camera(H, W, extrinsic, intrinsic)
-                    pkg = render(cam, local_gaussian, cfg, bg)
-                    img_r = pkg["render"]
-                    psnr_sum += psnr(img_r, image_gt).mean().item()
-                    n += 1
-            if tb_writer and n > 0:
-                tb_writer.add_scalar(f"block_{block_id}/train-PSNR", psnr_sum / n, iteration)
-            
-            # 完整的中间评估 (包含LPIPS)
-            print(f"\n🔍 INTERMEDIATE EVALUATION AT ITERATION {iteration}")
-            eval_metrics(
-                local_gaussian,
-                train_views_info_list=views_info_list,
-                cfg=cfg,
-                bg=bg,
-                device=device,
-                eval_views_info=eval_views_info,
-                sample_k=20,  # 快速评估，少量图片
-                max_images=10,
-                save_dir=cfg.output_dirpath,
-                prefix=f"Block_{block_id}_Iter_{iteration}"
-            )
+        # -------- Periodic PSNR & Intermediate Eval --------
+        # Disable periodic evaluation (only keep two evaluations: pre-RVQ and final save)
 
         # -------- Save at end --------
         if iteration == cfg.iterations:
@@ -642,33 +622,84 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                 cfg=cfg,
                 bg=bg,
                 device=device,
-                eval_views_info=eval_views_info,  # 可为 None
+                eval_views_info=eval_views_info,  # can be None
                 sample_k=100,
-                max_images=None,                  # None=选多少评多少
-                save_dir=cfg.output_dirpath,
+                max_images=None,
+                save_dir=os.path.join(point_cloud_path, str(block_id)),
                 prefix=f"Block_{block_id}"
             )
             end_time = time.time()
 
             os.makedirs(os.path.join(point_cloud_path, str(block_id)), exist_ok=True)
 
-            # export-only 模式：仅在保存前量化并导出
-            if vq_enabled and vq_mode == 'export' and len(kmeans_quantizers) > 0:
-                print("\n" + "=" * 60)
-                print(f"🎯 RUNNING K-MEANS (EXPORT) FOR BLOCK {block_id}")
-                print("=" * 60)
-                if 'dc' in kmeans_quantizers:
-                    kmeans_quantizers['dc'].forward_dc(local_gaussian, assign=True)
-                if 'sh' in kmeans_quantizers:
-                    kmeans_quantizers['sh'].forward_frest(local_gaussian, assign=True)
-
-            # 保存：量化版 + 原始版
+            # Save: quantized version + original version
             save_attributes = ['xyz', 'f_dc', 'f_rest', 'opacity', 'scale', 'rotation']
 
-            if vq_enabled and len(kmeans_quantizers) > 0 and (vq_mode in ['online', 'export']) and iteration >= kmeans_st_iter:
+            if cfg.vq_mode == 'online':
+                # Quantization/reassignment completed during training, save directly
+                if len(kmeans_quantizers) > 0 and iteration >= kmeans_st_iter:
+                    print("\n" + "=" * 60)
+                    print(f"💾 SAVING FINAL RESULTS WITH RVQ FOR BLOCK {block_id}")
+                    print("=" * 60)
+
+                    local_gaussian.save_ply(
+                        os.path.join(point_cloud_path, str(block_id),
+                                     f"point_cloud_{iteration:03d}_quantized.ply"),
+                        save_q=quantized_params,
+                        save_attributes=save_attributes
+                    )
+                    local_gaussian.save_ply(
+                        os.path.join(point_cloud_path, str(block_id),
+                                     f"point_cloud_{iteration:03d}_original.ply"),
+                        save_q=[],
+                        save_attributes=save_attributes
+                    )
+                    save_vq_results(
+                        kmeans_quantizers,
+                        os.path.join(point_cloud_path, str(block_id), "vq_results")
+                    )
+                else:
+                    local_gaussian.save_ply(
+                        os.path.join(point_cloud_path, str(block_id), f"point_cloud_{iteration:03d}.ply")
+                    )
+            else:
+                # export mode: no quantization during training, execute offline quantization once and export
                 print("\n" + "=" * 60)
-                print(f"💾 SAVING FINAL RESULTS WITH VQ FOR BLOCK {block_id}")
+                print(f"💾 EXPORTING RVQ ARTIFACTS FOR BLOCK {block_id}")
                 print("=" * 60)
+
+                # Build offline quantizers (reuse training configuration parameters)
+                kmeans_quantizers = {}
+                if 'dc' in quantized_params:
+                    kmeans_quantizers['dc'] = Quantize_RVQ(
+                        which='dc',
+                        target_k=n_cls_dc,
+                        layers=rvq_layers,
+                        num_iters=n_it,
+                        sh_band_weighting=False,
+                        band_weight_alpha=band_weight_alpha,
+                        layer_aware_training=layer_aware_training,
+                        use_index_prior=False,
+                        index_prior_config=None
+                    )
+                if 'sh' in quantized_params:
+                    kmeans_quantizers['sh'] = Quantize_RVQ(
+                        which='sh',
+                        target_k=n_cls_sh,
+                        layers=rvq_layers,
+                        num_iters=n_it,
+                        sh_band_weighting=sh_band_weighting,
+                        band_weight_alpha=band_weight_alpha,
+                        layer_aware_training=layer_aware_training,
+                        use_index_prior=False,
+                        index_prior_config=None
+                    )
+
+                for pname, quantizer in kmeans_quantizers.items():
+                    if pname == 'dc':
+                        quantizer.forward_dc(local_gaussian, assign=True)
+                    elif pname == 'sh':
+                        quantizer.forward_frest(local_gaussian, assign=True)
 
                 local_gaussian.save_ply(
                     os.path.join(point_cloud_path, str(block_id),
@@ -682,11 +713,9 @@ def reconstruct(cfg, block_id, block_bbx_expand, views_info_list, init_pcd, eval
                     save_q=[],
                     save_attributes=save_attributes
                 )
-                save_vq_results(kmeans_quantizers, quantized_params,
-                                os.path.join(point_cloud_path, str(block_id), "vq_results"))
-            else:
-                local_gaussian.save_ply(
-                    os.path.join(point_cloud_path, str(block_id), f"point_cloud_{iteration:03d}.ply")
+                save_vq_results(
+                    kmeans_quantizers,
+                    os.path.join(point_cloud_path, str(block_id), "vq_results")
                 )
 
     print(f"Block {block_id} optimize finished, total num pts: {local_gaussian.get_xyz.shape[0]}")
@@ -702,12 +731,9 @@ def main():
     parser.add_argument("--output_dirpath", "-o", type=str, default=None, help="optimized result output dirpath")
     parser.add_argument("--block_ids", "-b", nargs="+", type=int, default=None)
 
-    # VQ parameters
-    parser.add_argument('--vq_mode', type=str, default='online', choices=['online', 'export'],
-                        help="VQ usage: 'online' uses quantized features during training; 'export' only quantizes at final export.")
-    # Note: We now use unified RVQ (layers=1 equals K-Means)
+    # RVQ parameters
     parser.add_argument('--rvq_layers', type=int, default=2,
-                        help='Number of RVQ layers (1 = equivalent to K-Means, 2+ = true RVQ)')
+                        help='Number of RVQ layers (1 = K-Means, 2+ = RVQ). Default: 2')
 
     parser.add_argument('--kmeans_st_iter', type=int, default=1000,
                         help='Start k-Means based vector quantization from this iteration (online mode only)')
@@ -719,33 +745,62 @@ def main():
                         help='Number of k-Means iterations')
     parser.add_argument('--kmeans_freq', type=int, default=500,
                         help='Frequency (iters) of reassignment in online mode')
-    # kmeans_max_samples parameter removed - now always uses full data for optimal initialization
 
     parser.add_argument("--quant_params", nargs="+", type=str, default=['sh', 'dc'],
                         help='Parameters to quantize: sh, dc')
 
+    # VQ mode: online (quantize during training) or export (quantize once at the end)
+    parser.add_argument('--vq_mode', type=str, choices=['online', 'export'], default='online',
+                        help='VQ mode: online (default) quantizes during training; export quantizes once at the end')
+
+    # IndexPrior parameters
+    parser.add_argument('--use_index_prior', action='store_true',
+                        help='Enable IndexPrior for context-aware quantization')
+
+    parser.add_argument('--index_prior_d_model', type=int, default=64,
+                        help='IndexPrior model dimension (default: 64)')
+    parser.add_argument('--index_prior_nhead', type=int, default=8,
+                        help='IndexPrior attention heads (default: 8)')
+    parser.add_argument('--index_prior_num_layers', type=int, default=2,
+                        help='IndexPrior transformer layers (default: 2)')
+
+    # Positional encoding switch (mutually exclusive, enabled by default)
+    pe_grp = parser.add_mutually_exclusive_group()
+    pe_grp.add_argument('--index_prior_use_pos_enc', dest='index_prior_use_pos_enc',
+                        action='store_true', help='Enable positional encoding in IndexPrior')
+    pe_grp.add_argument('--no_index_prior_use_pos_enc', dest='index_prior_use_pos_enc',
+                        action='store_false', help='Disable positional encoding in IndexPrior')
+    parser.set_defaults(index_prior_use_pos_enc=True)
+    
+    # IndexPrior checkpoint directory
+    parser.add_argument('--index_prior_ckpt_dir', type=str, default=None,
+                        help='Directory containing pre-trained IndexPrior checkpoints')
+
     args = parser.parse_args()
 
-    # Merge args into cfg
+    # Merge args into cfg - simplified configuration merging
     cfg = parse_cfg(args)
-    if not hasattr(cfg, 'vq_mode'):
-        cfg.vq_mode = args.vq_mode
-    # Unified RVQ approach - remove vq_type
-    if not hasattr(cfg, 'rvq_layers'):
-        cfg.rvq_layers = args.rvq_layers
-    if not hasattr(cfg, 'quant_params'):
-        cfg.quant_params = args.quant_params
-    if not hasattr(cfg, 'kmeans_st_iter'):
-        cfg.kmeans_st_iter = args.kmeans_st_iter
-    if not hasattr(cfg, 'kmeans_ncls_sh'):
-        cfg.kmeans_ncls_sh = args.kmeans_ncls_sh
-    if not hasattr(cfg, 'kmeans_ncls_dc'):
-        cfg.kmeans_ncls_dc = args.kmeans_ncls_dc
-    if not hasattr(cfg, 'kmeans_iters'):
-        cfg.kmeans_iters = args.kmeans_iters
-    if not hasattr(cfg, 'kmeans_freq'):
-        cfg.kmeans_freq = args.kmeans_freq
-    # kmeans_max_samples removed - full data initialization always used
+
+    # Use unified configuration merging function
+    def set_config_if_missing(key, value):
+        if not hasattr(cfg, key):
+            setattr(cfg, key, value)
+
+    set_config_if_missing('rvq_layers', args.rvq_layers)
+    set_config_if_missing('quant_params', args.quant_params)
+    set_config_if_missing('kmeans_st_iter', args.kmeans_st_iter)
+    set_config_if_missing('kmeans_ncls_sh', args.kmeans_ncls_sh)
+    set_config_if_missing('kmeans_ncls_dc', args.kmeans_ncls_dc)
+    set_config_if_missing('kmeans_iters', args.kmeans_iters)
+    set_config_if_missing('kmeans_freq', args.kmeans_freq)
+    set_config_if_missing('vq_mode', args.vq_mode)
+
+    # IndexPrior configuration
+    set_config_if_missing('use_index_prior', args.use_index_prior)
+    set_config_if_missing('index_prior_d_model', args.index_prior_d_model)
+    set_config_if_missing('index_prior_nhead', args.index_prior_nhead)
+    set_config_if_missing('index_prior_num_layers', args.index_prior_num_layers)
+    set_config_if_missing('index_prior_use_pos_enc', args.index_prior_use_pos_enc)
 
     # Scene & output
     scene = Scene(cfg.scene_dirpath, evaluate=cfg.evaluate, scene_scale=cfg.scene_scale)

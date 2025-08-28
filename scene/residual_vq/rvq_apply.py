@@ -1,53 +1,75 @@
 # rvq_apply.py
-# Stateless Residual K-Means VQ: pure functions for FIT (offline) and APPLY (runtime).
-# - rvq_fit  : given raw features, fit multi-layer codebooks via KMeans on residuals
+# Stateless Residual K-Means VQ: pure functions for APPLY (runtime).
 # - rvq_apply: given frozen codebooks, quantize features by residual stacking
-#
-# Notes:
-#   * No coupling to Gaussian/renderer. Input is (N, D), output indices + quantized sum.
-#   * Distance math is done in fp32 for stability; outputs use original dtype/device.
-#   * Use chunking to avoid VRAM spikes on large N.
 
 from __future__ import annotations
-from typing import List, Sequence, Tuple, Optional, Dict
+from typing import Dict, List, Sequence, Tuple
 
 import torch
 
-# If you have quantize_kmeans.py in the same package, this import will work.
-# It is only required for rvq_fit (to build codebooks). rvq_apply has no dependency.
-try:
-    from .vq_module import Quantize_kMeans  # noqa: F401
-    _HAS_QKM = True
-except ImportError:
-    _HAS_QKM = False
-
-
-# ----------------------------
-# Low-level distance helpers  
-# ----------------------------
-# Use vq_module's distance function to avoid duplication
+# We only reuse the stable distance form and keep API parity with the project.
 from .vq_module import Quantize_kMeans
-_pairwise_sqdist = Quantize_kMeans._pairwise_sqdist
+
+
+# -------------------------------------
+# Low-level, memory-safe NN primitives
+# -------------------------------------
+@torch.no_grad()
+def _tile_argmin_over_columns(
+    A: torch.Tensor,          # (m, D)
+    B: torch.Tensor,          # (n, D)
+    *,
+    col_chunk: int = 65536,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    For each row in A, find argmin over all rows in B without materializing (m,n).
+    Returns:
+      best_ids  : (m,)  indices into rows of B
+      best_dist2: (m,)  corresponding squared distances
+    Uses stable ||a||^2 + ||b||^2 - 2 a·b in fp32.
+    """
+    assert A.ndim == 2 and B.ndim == 2 and A.shape[1] == B.shape[1]
+    m = A.shape[0]
+
+    A32 = A.to(torch.float32, copy=False).contiguous()
+    B32 = B.to(torch.float32, copy=False).contiguous()
+
+    a2 = (A32 * A32).sum(dim=1, keepdim=True)                         # (m,1)
+
+    best_d2 = torch.full((m, 1), float("inf"), device=A.device, dtype=torch.float32)
+    best_j  = torch.full((m, 1), -1,           device=A.device, dtype=torch.long)
+
+    for s in range(0, B32.shape[0], col_chunk):
+        e = min(s + col_chunk, B32.shape[0])
+        Be = B32[s:e]                                                 # (b,D)
+        b2 = (Be * Be).sum(dim=1, keepdim=True).transpose(0, 1)       # (1,b)
+        dots = A32 @ Be.t()                                           # (m,b)
+        d2   = a2 + b2 - 2.0 * dots                                   # (m,b)
+
+        loc_best, loc_idx = d2.min(dim=1, keepdim=True)               # (m,1)
+        update = loc_best < best_d2
+        best_d2[update] = loc_best[update]
+        best_j[update]  = (loc_idx[update] + s)
+
+        # free temporaries early
+        del Be, b2, dots, d2, loc_best, loc_idx, update
+
+    return best_j.squeeze(1), best_d2.squeeze(1)
 
 
 @torch.no_grad()
-def _nearest_indices_chunked(x: torch.Tensor, C: torch.Tensor, chunk: int) -> torch.Tensor:
+def _nearest_indices_chunked(
+    x: torch.Tensor,          # (N, D)
+    C: torch.Tensor,          # (K, D)
+    *,
+    col_chunk: int = 65536,
+) -> torch.Tensor:
     """
-    Return nearest-center indices for x wrt codebook C, in chunks.
+    Return nearest-center indices for x w.r.t. codebook C, using column-chunked argmin.
     x: (N, D), C: (K, D) -> idx: (N,)
     """
-    N = x.shape[0]
-    idx_chunks: List[torch.Tensor] = []
-    for i in range(0, N, chunk):
-        xi = x[i:i + chunk].to(torch.float32)
-        Ci = C.to(torch.float32)
-        # d2 = ||x||^2 + ||c||^2 - 2 x·c
-        x2 = (xi * xi).sum(dim=1, keepdim=True)       # (m,1)
-        c2 = (Ci * Ci).sum(dim=1, keepdim=True).t()   # (1,K)
-        d2 = x2 + c2 - 2.0 * (xi @ Ci.t())            # (m,K)
-        idx = torch.argmin(d2, dim=1)                 # (m,)
-        idx_chunks.append(idx)
-    return torch.cat(idx_chunks, dim=0)
+    idx, _ = _tile_argmin_over_columns(x, C, col_chunk=col_chunk)
+    return idx
 
 
 # ----------------------------
@@ -58,15 +80,16 @@ def rvq_apply(
     feat_2d: torch.Tensor,
     codebooks: Sequence[torch.Tensor],
     *,
-    chunk: int = 32768,
+    chunk: int = 32768,               # kept for API parity; used as row-chunk when we extend to 2D tiling
     return_residual: bool = False,
 ) -> Tuple[List[torch.LongTensor], torch.Tensor] | Tuple[List[torch.LongTensor], torch.Tensor, torch.Tensor]:
     """
     Apply residual vector quantization with frozen codebooks (stateless).
+
     Args:
-      feat_2d       : (N, D) input features.
-      codebooks     : [C0 (K0,D), C1 (K1,D), ...], same D across layers.
-      chunk         : per-chunk size for distance evaluation.
+      feat_2d        : (N, D) input features.
+      codebooks      : [C0 (K0,D), C1 (K1,D), ...], same D across layers.
+      chunk          : kept for API compatibility; not directly used in column tiling.
       return_residual: if True, also returns final residual (x - sum(q_l)).
 
     Returns:
@@ -76,87 +99,43 @@ def rvq_apply(
     """
     assert feat_2d.ndim == 2, "feat_2d must be (N, D)"
     if len(codebooks) == 0:
-        # Zero-layer RVQ: trivial outputs
         z = torch.zeros_like(feat_2d)
-        return [], z if not return_residual else ([], z, feat_2d.clone())
+        return ([], z, feat_2d.clone()) if return_residual else ([], z)
 
-    # Basic shape checks
+    # Basic checks
     D = int(feat_2d.shape[1])
     for i, C in enumerate(codebooks):
         assert C.ndim == 2, f"codebook L{i} must be 2D (K,D)"
         assert int(C.shape[1]) == D, f"codebook L{i} D={C.shape[1]} != {D}"
 
-    residual = feat_2d
-    q_sum = torch.zeros_like(residual)
+    # Make sure tensors are contiguous to avoid implicit copies
+    x = feat_2d.contiguous()
     ids_list: List[torch.LongTensor] = []
+    q_sum = torch.zeros_like(x)
+    residual = x
+
+    # Heuristic: pick column chunk to bound (N_chunk × col_chunk × 4B) within ~512MB.
+    # Since we tile over columns only here, use a high default 65536; safe for large K.
+    col_chunk = 65536
 
     for C in codebooks:
-        idx = _nearest_indices_chunked(residual, C, chunk=chunk)  # (N,)
+        Cc = C.contiguous()
+        idx = _nearest_indices_chunked(residual, Cc, col_chunk=col_chunk)  # (N,)
         ids_list.append(idx)
-        piece = C[idx]  # (N, D) on C's device/dtype
-        # Align to input dtype/device if needed (usually already aligned)
-        if piece.dtype != feat_2d.dtype or piece.device != feat_2d.device:
-            piece = piece.to(dtype=feat_2d.dtype, device=feat_2d.device)
+
+        piece = Cc[idx]  # (N, D)
+        if piece.dtype != x.dtype or piece.device != x.device:
+            piece = piece.to(dtype=x.dtype, device=x.device)
+
         q_sum = q_sum + piece
         residual = residual - piece
 
     return (ids_list, q_sum, residual) if return_residual else (ids_list, q_sum)
 
 
-@torch.no_grad()
-def rvq_fit(
-    feat_2d: torch.Tensor,
-    layers: Sequence[int],
-    *,
-    num_iters: int = 10,
-    chunk_size: int = 32768,
-) -> Tuple[List[torch.Tensor], List[torch.LongTensor], torch.Tensor]:
-    """
-    Fit residual K-Means codebooks layer-by-layer (stateful inside, stateless API).
-    Requires quantize_kmeans. Produces frozen codebooks ready for rvq_apply.
-
-    Args:
-      feat_2d    : (N, D)
-      layers     : e.g., [2048, 1024] -> two layers
-      num_iters  : KMeans iters per layer
-      chunk_size : assignment chunk size
-
-    Returns:
-      codebooks  : [C0 (K0,D), C1 (K1,D), ...]
-      ids_list   : [LongTensor(N), ...] indices from the fit pass (useful for analysis)
-      q_sum      : (N, D) reconstruction from the fit pass
-    """
-    assert _HAS_QKM, "quantize_kmeans.Quantize_kMeans not found; ensure it is importable."
-    assert feat_2d.ndim == 2, "feat_2d must be (N, D)"
-    assert len(layers) >= 1, "layers must be non-empty"
-
-    residual = feat_2d.detach()
-    q_sum = torch.zeros_like(residual)
-
-    codebooks: List[torch.Tensor] = []
-    ids_list: List[torch.LongTensor] = []
-
-    for li, K in enumerate(layers):
-        q = Quantize_kMeans(num_clusters=int(K), num_iters=int(num_iters))
-        q.cluster_assign(residual, chunk_size=chunk_size)
-
-        if q.centers.numel() == 0:
-            # Degenerate layer (e.g., zero variance). Stop stacking.
-            break
-
-        idx = q.nn_index.clone()
-        piece = q.centers[idx]
-        q_sum = q_sum + piece
-        residual = residual - piece
-
-        codebooks.append(q.centers.detach().clone())
-        ids_list.append(idx)
-
-    return codebooks, ids_list, q_sum
-
-
 # ----------------------------
 # Convenience: dict wrappers for per-parameter (e.g., "dc"/"sh")
+# Note: For fitting, use ResidualKMeansVQ.fit() instead of rvq_fit
 # ----------------------------
 @torch.no_grad()
 def rvq_apply_dict(
@@ -176,23 +155,4 @@ def rvq_apply_dict(
     for k, x in feats.items():
         cbs = codebooks_dict.get(k, [])
         out[k] = rvq_apply(x, cbs, chunk=chunk, return_residual=return_residual)
-    return out
-
-
-@torch.no_grad()
-def rvq_fit_dict(
-    feats: Dict[str, torch.Tensor],
-    layers_dict: Dict[str, Sequence[int]],
-    *,
-    num_iters: int = 10,
-    chunk_size: int = 32768,
-) -> Dict[str, tuple]:
-    """
-    Fit RVQ per key; returns dict mapping key -> (codebooks, ids_list, q_sum)
-    """
-    assert _HAS_QKM, "quantize_kmeans.Quantize_kMeans not found; ensure it is importable."
-    out: Dict[str, tuple] = {}
-    for k, x in feats.items():
-        layers = layers_dict.get(k, [])
-        out[k] = rvq_fit(x, layers, num_iters=num_iters, chunk_size=chunk_size)
     return out

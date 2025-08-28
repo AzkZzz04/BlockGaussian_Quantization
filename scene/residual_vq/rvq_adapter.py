@@ -1,80 +1,99 @@
-# 保持老接口：forward_dc / forward_frest
-# 内部用 ResidualKMeansVQ 实现；当层数=1时就等价普通VQ
+# Adapter for legacy interface: forward_dc / forward_frest
+# Internally uses ResidualKMeansVQ; when layers=1 it equals plain VQ
+
 import math
 import torch
+from functools import lru_cache
 from typing import List, Optional
-from .rvq import ResidualKMeansVQ  # 你已有的 RVQ 实现
 
+from .rvq import ResidualKMeansVQ  # Your existing RVQ implementation
+
+
+# ----------------------------
+# K allocation (layer-wise decreasing + exact sum preservation)
+# ----------------------------
 def _k_per_layer(target_k: int, L: int) -> List[int]:
     """
-    计算每层的聚类数 - 渐进式策略 (第一层最大，后续层递减)
-    使用简单的比例分配，更直观易懂
+    Progressive allocation (earlier layers get more weight), exactly satisfying sum(k_i)=target_k.
+    Uses harmonic series weights + largest remainder method, ensuring each layer has at least 2.
     """
-    if L == 1:
-        return [target_k]
-    
-    # 渐进式权重分配：第一层占主导，后续层递减
-    # 基于倒数递减：[1, 1/2, 1/3, 1/4, ...]
-    weights = [1.0 / (i + 1) for i in range(L)]
-    total_weight = sum(weights)
-    
-    # 归一化权重，确保总和为1
-    normalized_weights = [w / total_weight for w in weights]
-    
-    # 分配聚类数，确保每层至少有2个聚类
-    result = []
-    allocated_total = 0
-    
-    for i, weight in enumerate(normalized_weights):
-        if i == L - 1:  # 最后一层：分配剩余的
-            k = max(2, target_k - allocated_total)
-        else:
-            k = max(2, int(target_k * weight))
-            allocated_total += k
-        result.append(k)
-    
-    return result
+    if L <= 1:
+        return [max(2, target_k)]
 
-def _compute_sh_band_weights(sh_degree: int, alpha: float = 0.15) -> torch.Tensor:
+    # harmonic weights: 1, 1/2, 1/3, ...
+    weights = [1.0 / (i + 1) for i in range(L)]
+    total_w = sum(weights)
+
+    raw = [target_k * w / total_w for w in weights]          # floating point quotas
+    base = [max(2, int(math.floor(x))) for x in raw]         # floor and ensure minimum
+    remain = target_k - sum(base)
+
+    if remain > 0:
+        # remaining quotas to allocate: supplement by "how far from expected" in descending order
+        frac_gain = [(raw[i] - (base[i] - 2)) for i in range(L)]
+        order = sorted(range(L), key=lambda i: frac_gain[i], reverse=True)
+        for i in range(remain):
+            base[order[i % L]] += 1
+    elif remain < 0:
+        # over-allocated: reduce by "reducible space" in descending order, keeping minimum of 2
+        need = -remain
+        frac_loss = [(base[i] - 2) - (raw[i] - (base[i] - 2)) for i in range(L)]
+        order = sorted(range(L), key=lambda i: frac_loss[i], reverse=True)
+        for i in range(L):
+            can = min(base[order[i]] - 2, need)
+            if can > 0:
+                base[order[i]] -= can
+                need -= can
+            if need == 0:
+                break
+
+    # light smoothing: ensure non-increasing (front layer >= back layer), preserving total sum
+    for i in range(1, L):
+        if base[i] > base[i - 1]:
+            delta = base[i] - base[i - 1]
+            base[i] -= delta
+            base[0] += delta
+
+    return base
+
+
+# ----------------------------
+# SH band weights
+# ----------------------------
+def _compute_sh_band_weights(sh_degree: int, alpha: float = 0.15, include_dc: bool = True) -> torch.Tensor:
     """
-    计算SH频带权重：w_l = 1 + α * l(l+1)
-    高频分量获得更高权重，改善LPIPS
-    包含DC分量 (l=0)
+    Compute SH band weights: w_l = 1 + α * l(l+1)
+    Higher frequency components get higher weights to improve perceptual quality.
     """
     weights = []
-    for l in range(sh_degree + 1):
-        for m in range(-l, l + 1):
-            weight = 1.0 + alpha * l * (l + 1)
-            weights.append(weight)
+    start_l = 0 if include_dc else 1
+    for l in range(start_l, sh_degree + 1):
+        for _m in range(-l, l + 1):
+            weights.append(1.0 + alpha * l * (l + 1))
     return torch.tensor(weights, dtype=torch.float32)
+
 
 def _compute_sh_band_weights_no_dc(sh_degree: int, alpha: float = 0.15) -> torch.Tensor:
-    """
-    计算SH频带权重：w_l = 1 + α * l(l+1)  
-    高频分量获得更高权重，改善LPIPS
-    不包含DC分量 (跳过l=0)
-    """
-    weights = []
-    for l in range(1, sh_degree + 1):  # 从l=1开始，跳过DC
-        for m in range(-l, l + 1):
-            weight = 1.0 + alpha * l * (l + 1)
-            weights.append(weight)
-    return torch.tensor(weights, dtype=torch.float32)
+    """SH band weights excluding DC component"""
+    return _compute_sh_band_weights(sh_degree, alpha, include_dc=False)
 
+
+@lru_cache(maxsize=32)
+def _cached_sh_weights(C: int, alpha: float) -> torch.Tensor:
+    """
+    Cached SH weights (excluding DC):
+    Input C is the number of SH coefficients per channel (excluding DC), verified for degree consistency.
+    """
+    deg = int(round(math.sqrt(C + 1) - 1))
+    assert (deg + 1) * (deg + 1) - 1 == C, f"Invalid SH C={C} for degree deduction"
+    return _compute_sh_band_weights_no_dc(deg, alpha)  # (C,)
+
+
+# ----------------------------
+# RVQ quantization adapter
+# ----------------------------
 class Quantize_RVQ:
-    """
-    Drop-in 适配器：兼容旧的 Quantize_kMeans API。
-    - forward_dc(gaussian, assign=False)
-    - forward_frest(gaussian, assign=False)
 
-    参数：
-      which: 'dc' 或 'sh'，用于日志与形状处理
-      target_k: 目标码本大小；当 layers=1 时就是普通 VQ 的 K
-      layers: RVQ 层数（=1 等价普通 VQ）
-      num_iters: 每层 KMeans 迭代数
-      sh_band_weighting: 是否对SH使用频带重加权（改善高频保持）
-      band_weight_alpha: 频带权重强度参数
-    """
     def __init__(self,
                  which: str,
                  target_k: int = 4096,
@@ -82,232 +101,237 @@ class Quantize_RVQ:
                  num_iters: int = 10,
                  sh_band_weighting: bool = True,
                  band_weight_alpha: float = 0.15,
-                 layer_aware_training: bool = True):
+                 layer_aware_training: bool = True,
+                 use_index_prior: bool = False,
+                 index_prior_config: Optional[dict] = None,
+                 use_multi_gpu: bool = False,
+                 gpu_devices: tuple = (0, 1)):
         assert which in ("dc", "sh"), "which must be 'dc' or 'sh'"
         self.which = which
         self.layers = max(1, int(layers))
         self.target_k = int(target_k)
         self.num_iters = int(num_iters)
         self.sh_band_weighting = sh_band_weighting and (which == "sh")
-        self.band_weight_alpha = band_weight_alpha
-        self.layer_aware_training = layer_aware_training
+        self.band_weight_alpha = float(band_weight_alpha)
+        self.layer_aware_training = bool(layer_aware_training)
+        self.use_index_prior = bool(use_index_prior)
 
-        # 构造每层 K；使用渐进式分配策略
+        # Construct per-layer K; progressive allocation with exact sum preservation
         layer_ks = _k_per_layer(self.target_k, self.layers)
-        
+
+        # IndexPrior configuration (placeholder/passthrough)
+        if index_prior_config is None:
+            index_prior_config = {
+                "d_model": 64,
+                "nhead": 8,
+                "num_layers": 2,
+                "use_positional_encoding": True,
+            }
+        self.index_prior_config = index_prior_config
+
+        # RVQ main body (should internally accept use_index_prior / positions etc.)
         self._rvq = ResidualKMeansVQ(
             num_clusters=layer_ks,
-            num_iters=self.num_iters
+            num_iters=self.num_iters,
+            use_index_prior=self.use_index_prior
         )
 
-        # 兼容性属性（旧代码可能会读）
-        self.num_clusters = self.target_k          # 仅用于显示
-        self.num_kmeans_iters = self.num_iters     # 仅用于显示
-        self.cls_ids = torch.empty(0, dtype=torch.long)  # 最后一层索引（形状兼容）
-        self.centers = torch.empty(0)              # RVQ 多层码本，不再单一 centers；保留占位
+        # Compatibility attributes (old code might read these)
+        self.num_clusters = self.target_k          # for display only
+        self.num_kmeans_iters = self.num_iters     # for display only
+        self.cls_ids = torch.empty(0, dtype=torch.long)  # last layer indices (shape compatible)
+        self.centers = torch.empty(0)              # RVQ multi-layer codebooks, no longer single centers; placeholder to avoid breaking interface
 
         self._fitted = False
-        self._last_ids_list = None  # 多层索引缓存（用于落盘）
-        self._sh_weights = None     # SH频带权重缓存
-        
-        # Layer-aware training state
-        self._layer_losses = []     # 记录每层损失，用于层间对齐
-        self._training_mode = False # 是否在训练模式（需要损失反馈）
+        self._last_ids_list = None  # multi-layer indices cache (for saving)
 
+        # Layer-aware training state (statistics only, no backprop)
+        self._layer_losses: List[List[float]] = []
+        self._training_mode = False
+
+    # ----------------------------
+    # Internal flatten/restore
+    # ----------------------------
     @torch.no_grad()
     def _flat_dc(self, gaussian):
         # (N,1,3) -> (N,3)
-        return gaussian._features_dc.detach().reshape(-1, 3)
+        x = gaussian.get_features_dc.detach()
+        return x.reshape(-1, 3).contiguous()
 
     @torch.no_grad()
     def _flat_sh(self, gaussian):
         # (N,C,3) -> (N, C*3)
-        C = gaussian._features_rest.shape[1]
-        feat = gaussian._features_rest.detach().reshape(-1, C * 3)
-        
-        # 应用频带重加权
+        fr = gaussian.get_features_rest.detach()
+        N, C, _ = fr.shape
+        feat = fr.reshape(N, C * 3).contiguous()
+
         if self.sh_band_weighting:
-            if self._sh_weights is None or self._sh_weights.device != feat.device:
-                # 推断SH度数：处理不包含DC的SH情况
-                # C=15 (degree=3, 不含DC): (3+1)^2 - 1 = 15
-                # C=3 (degree=1, 不含DC): (1+1)^2 - 1 = 3  
-                # 通用公式: degree = sqrt(C + 1) - 1
-                sh_degree = int(math.sqrt(C + 1) - 1)
-                
-                # 调试信息
-                expected_coeffs_with_dc = (sh_degree + 1) ** 2
-                expected_coeffs_no_dc = expected_coeffs_with_dc - 1
-                print(f"[SH Band Weighting] C={C}, inferred degree={sh_degree}")
-                print(f"  Expected coeffs: with_DC={expected_coeffs_with_dc}, no_DC={expected_coeffs_no_dc}")
-                
-                # 计算权重时只对实际存在的系数分量计算
-                self._sh_weights = _compute_sh_band_weights_no_dc(sh_degree, self.band_weight_alpha).to(feat.device)
-                
-                # 验证维度匹配
-                if len(self._sh_weights) != C:
-                    print(f"[WARNING] SH weight dimension mismatch: expected {C}, got {len(self._sh_weights)}")
-                    print(f"  C={C}, inferred sh_degree={sh_degree}")
-                    # 降级到不使用频带重加权
-                    self._sh_weights = torch.ones(C, dtype=torch.float32, device=feat.device)
-                else:
-                    print(f"[SH Band Weighting] Successfully created weights: shape={self._sh_weights.shape}")
-                    # 打印权重值分布用于调试
-                    print(f"  Weight range: [{self._sh_weights.min():.3f}, {self._sh_weights.max():.3f}]")
-            
-            # 重加权：对每个3D点的每个SH系数应用权重
-            # feat: (N, C*3), weights: (C,) -> 广播到 (N, C*3)
-            if len(self._sh_weights) == C:
-                weights_expanded = self._sh_weights.repeat_interleave(3).unsqueeze(0)  # (1, C*3)
-                if weights_expanded.shape[1] == feat.shape[1]:  # 双重检查维度
-                    feat = feat * weights_expanded
-                else:
-                    print(f"[WARNING] Weight expansion dimension mismatch: {weights_expanded.shape[1]} vs {feat.shape[1]}")
-            else:
-                print(f"[WARNING] Skipping SH band weighting due to dimension mismatch")
-            
+            sh_weights = _cached_sh_weights(C, self.band_weight_alpha).to(feat.device, non_blocking=True)  # (C,)
+            weights_expanded = sh_weights.repeat_interleave(3).unsqueeze(0)  # (1, C*3)
+            assert weights_expanded.shape[1] == feat.shape[1], "SH weight expansion mismatch"
+            feat = feat * weights_expanded
         return feat
 
     @staticmethod
-    def _shape_dc(x):
+    def _shape_dc(x: torch.Tensor) -> torch.Tensor:
         # (N, 3) -> (N,1,3)
         return x.reshape(-1, 1, 3)
 
     @staticmethod
-    def _shape_sh(x, C):
+    def _shape_sh(x: torch.Tensor, C: int) -> torch.Tensor:
         # (N, C*3) -> (N,C,3)
         return x.reshape(-1, C, 3)
 
+    def _rvq_is_fitted(self) -> bool:
+        """Try not to depend on internal implementation: prefer calling is_fitted(), otherwise check if codebooks exist."""
+        if hasattr(self._rvq, "is_fitted") and callable(self._rvq.is_fitted):
+            try:
+                return bool(self._rvq.is_fitted())
+            except Exception:
+                pass
+        if hasattr(self._rvq, "get_codebooks"):
+            try:
+                cbs = self._rvq.get_codebooks()
+                return (isinstance(cbs, (list, tuple)) and len(cbs) > 0)
+            except Exception:
+                return False
+        return self._fitted
+
+    # ----------------------------
+    # Forward (DC)
+    # ----------------------------
     @torch.no_grad()
     def forward_dc(self, gaussian, assign: bool = False):
         if self.which != "dc":
             return
+
         feat = self._flat_dc(gaussian)
-        
-        # 准备层间感知训练的损失回调
+        positions = gaussian.get_xyz.contiguous() if self.use_index_prior else None
+
+        # Inter-layer loss statistics callback (no backprop)
         loss_callback = None
         if self._training_mode and assign and self.layer_aware_training:
             def dc_loss_callback(layer_idx, reconstruction):
-                # 临时设置量化DC来计算损失
-                original_dc = gaussian._features_dc.clone()
-                try:
-                    gaussian._features_dc = self._shape_dc(reconstruction)
-                    # 这里需要实际的损失计算，暂时用简单的L2作为占位符
-                    loss = torch.mean((reconstruction - feat) ** 2).item()
-                    self.record_layer_loss(layer_idx, loss)
-                    return loss
-                finally:
-                    gaussian._features_dc = original_dc
+                loss = torch.mean((reconstruction - feat) ** 2).item()
+                self.record_layer_loss(layer_idx, loss)
+                return loss
             loss_callback = dc_loss_callback
-        
+
         if (not self._fitted) or assign:
-            ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback)
+            ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback, positions=positions)
             self._fitted = True
         else:
-            ids_list, q = self._rvq.quantize(feat)
-        gaussian.set_quantized_dc(self._shape_dc(q), ids_list[-1])
-        self.cls_ids = ids_list[-1]                    # 兼容旧保存逻辑（仅保存最后一层）
-        self._last_ids_list = ids_list                 # 完整多层索引缓存
+            if not self._rvq_is_fitted():
+                ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback, positions=positions)
+                self._fitted = True
+            else:
+                ids_list, q = self._rvq.quantize(feat, positions=positions)
 
+        gaussian.set_quantized_dc(self._shape_dc(q), ids_list[-1])
+        self.cls_ids = ids_list[-1]         # compatible with old save logic (only save last layer)
+        self._last_ids_list = ids_list      # complete multi-layer indices cache
+
+    # ----------------------------
+    # Forward (SH / features_rest)
+    # ----------------------------
     @torch.no_grad()
     def forward_frest(self, gaussian, assign: bool = False):
         if self.which != "sh":
             return
-        C = gaussian._features_rest.shape[1]
+
+        features_rest = gaussian.get_features_rest
+        C = features_rest.shape[1]
         feat = self._flat_sh(gaussian)
-        
-        # 准备层间感知训练的损失回调
+        positions = gaussian.get_xyz.contiguous() if self.use_index_prior else None
+
+        # Inter-layer loss statistics callback (no backprop)
         loss_callback = None
         if self._training_mode and assign and self.layer_aware_training:
             def sh_loss_callback(layer_idx, reconstruction):
-                # 反向重加权恢复（如果启用了频带重加权）
                 rec_unweighted = reconstruction
-                if self.sh_band_weighting and self._sh_weights is not None:
-                    if len(self._sh_weights) == C:
-                        weights_expanded = self._sh_weights.repeat_interleave(3).unsqueeze(0)
-                        if weights_expanded.shape[1] == reconstruction.shape[1]:
-                            rec_unweighted = reconstruction / weights_expanded
-                
-                # 临时设置量化SH来计算损失
-                original_sh = gaussian._features_rest.clone()
-                try:
-                    gaussian._features_rest = self._shape_sh(rec_unweighted, C)
-                    # 这里需要实际的损失计算，暂时用简单的L2作为占位符
-                    loss = torch.mean((rec_unweighted - feat) ** 2).item()
-                    self.record_layer_loss(layer_idx, loss)
-                    return loss
-                finally:
-                    gaussian._features_rest = original_sh
+                if self.sh_band_weighting:
+                    sh_weights = _cached_sh_weights(C, self.band_weight_alpha).to(reconstruction.device, non_blocking=True)
+                    weights_expanded = sh_weights.repeat_interleave(3).unsqueeze(0)
+                    assert weights_expanded.shape[1] == reconstruction.shape[1], "SH weight expansion mismatch in callback"
+                    rec_unweighted = reconstruction / weights_expanded
+                loss = torch.mean((rec_unweighted - feat) ** 2).item()
+                self.record_layer_loss(layer_idx, loss)
+                return loss
             loss_callback = sh_loss_callback
-        
+
         if (not self._fitted) or assign:
-            ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback)
+            ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback, positions=positions)
             self._fitted = True
         else:
-            ids_list, q = self._rvq.quantize(feat)
-        
-        # 反向重加权恢复
-        if self.sh_band_weighting and self._sh_weights is not None:
-            if len(self._sh_weights) == C:
-                weights_expanded = self._sh_weights.repeat_interleave(3).unsqueeze(0)  # (1, C*3)
-                if weights_expanded.shape[1] == q.shape[1]:  # 维度检查
-                    q = q / weights_expanded  # 恢复原始尺度
-            
+            if not self._rvq_is_fitted():
+                ids_list, q = self._rvq.fit(feat, loss_callback=loss_callback, positions=positions)
+                self._fitted = True
+            else:
+                ids_list, q = self._rvq.quantize(feat, positions=positions)
+
+        # Restore original scale (only if reweighting was applied previously)
+        if self.sh_band_weighting:
+            sh_weights = _cached_sh_weights(C, self.band_weight_alpha).to(q.device, non_blocking=True)
+            weights_expanded = sh_weights.repeat_interleave(3).unsqueeze(0)  # (1, C*3)
+            assert weights_expanded.shape[1] == q.shape[1], "SH weight expansion mismatch in recovery"
+            q = q / weights_expanded
+
         gaussian.set_quantized_sh(self._shape_sh(q, C), ids_list[-1])
         self.cls_ids = ids_list[-1]
         self._last_ids_list = ids_list
 
-    # 提供获取多层码本/索引的接口，供落盘
+    # ----------------------------
+    # Export/state helpers
+    # ----------------------------
     def get_codebooks(self):
         return self._rvq.get_codebooks()
 
     def get_all_level_indices(self):
         return self._last_ids_list
 
+    # Compatible with old calls: export pipeline will call get_all_indices()
+    def get_all_indices(self):
+        return self.get_all_level_indices()
+
     def enable_layer_aware_training(self, enable: bool = True):
-        """启用/禁用层间感知训练模式"""
-        self._training_mode = enable
+        """Enable/disable layer-aware training mode (statistics only, no gradient effect)"""
+        self._training_mode = bool(enable)
         if enable:
             self._layer_losses = []
-    
+
     def get_layer_loss_weights(self) -> List[float]:
         """
-        计算每层的损失权重：后层更注重感知质量
-        Layer t 的 LPIPS 权重: 0.3 + 0.2 * t / L
+        Calculate per-layer loss weights (for logging/visualization only): later layers focus more on perceptual quality.
+        Example weight for layer t: 0.3 + 0.2 * t / (L-1) (doesn't affect training numerics)
         """
         if not self.layer_aware_training or self.layers == 1:
             return [1.0] * self.layers
-        
+
         weights = []
         for t in range(self.layers):
-            # 基础权重 + 层间递增
-            lpips_weight = 0.3 + 0.2 * t / (self.layers - 1)
-            l1_weight = 1.0 - 0.3 * t / (self.layers - 1)  # 早层更关注L1
-            ssim_weight = 0.2  # 保持固定
-            
-            # 组合权重 (相对于标准损失 L1 + 0.2*SSIM + 0.5*LPIPS)
-            total_weight = l1_weight + ssim_weight + lpips_weight
-            weights.append(total_weight)
-        
+            lpips_w = 0.3 + 0.2 * t / max(1, (self.layers - 1))
+            l1_w = 1.0 - 0.3 * t / max(1, (self.layers - 1))
+            ssim_w = 0.2
+            weights.append(lpips_w + l1_w + ssim_w)
         return weights
-    
+
     def record_layer_loss(self, layer_idx: int, loss_value: float):
-        """记录特定层的损失值，用于分析"""
+        """Record loss value for specific layer (statistics only)"""
         if self._training_mode:
             while len(self._layer_losses) <= layer_idx:
                 self._layer_losses.append([])
-            self._layer_losses[layer_idx].append(loss_value)
-    
+            self._layer_losses[layer_idx].append(float(loss_value))
+
     def get_layer_loss_stats(self) -> dict:
-        """获取层损失统计信息"""
+        """Get layer loss statistics (for logging only)"""
         if not self._layer_losses:
             return {}
-        
         stats = {}
         for i, losses in enumerate(self._layer_losses):
             if losses:
                 stats[f"layer_{i}"] = {
                     "mean": sum(losses) / len(losses),
                     "count": len(losses),
-                    "recent": losses[-10:]  # 最近10个值
+                    "recent": losses[-10:],
                 }
         return stats

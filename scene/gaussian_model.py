@@ -1,14 +1,14 @@
-# gaussian_model.py
 #
-# Copyright (C) ...
-# See LICENSE.md
+# Copyright (C) 2023, Inria
+# GRAPHDECO research group, https://team.inria.fr/graphdeco
+# All rights reserved.
 #
-# Notes:
-# - Quantized PLY: 使用 f_dc_idx / f_rest_idx 字段保存索引；load_ply 自适应老/新格式
-# - clear_quantized: 安全设备选择
-# - 去掉到处的 .cuda() 硬编码，统一用当前 tensor 的 device
-# - 修正 densify_and_prune 的 squeeze 拼写错误
-# - replace_tensor_to_optimizer 更健壮
+# This software is free for non-commercial, research and evaluation use 
+# under the terms of the LICENSE.md file.
+#
+# For inquiries contact  george.drettakis@inria.fr
+#
+
 
 import os
 import json
@@ -51,7 +51,6 @@ class GaussianModel:
         self.optimizer_type = optimizer_type
         self.max_sh_degree = sh_degree
 
-        # Original parameters
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)
         self._features_rest = torch.empty(0)
@@ -59,13 +58,11 @@ class GaussianModel:
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
 
-        # Quantized parameters (runtime fields)
         self._features_dc_q = torch.empty(0)
         self._features_rest_q = torch.empty(0)
         self.dc_cluster_ids = None
         self.sh_cluster_ids = None
 
-        # Aux
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -75,34 +72,30 @@ class GaussianModel:
 
         self.setup_functions()
 
-    # -------------------------
-    # Quantization helpers
-    # -------------------------
     def set_quantized_dc(self, features_dc_q: torch.Tensor, cluster_ids: torch.Tensor):
-        assert features_dc_q.shape[:2] == self._features_dc.shape[:2], \
-            f"DC q-shape mismatch: got {features_dc_q.shape}, expect (N,1,*) like {self._features_dc.shape}"
+        if self._features_dc is not None:
+            assert features_dc_q.shape[:2] == self._features_dc.shape[:2], \
+                f"DC q-shape mismatch: got {features_dc_q.shape}, expect (N,1,*) like {self._features_dc.shape}"
         self._features_dc_q = features_dc_q
         self.dc_cluster_ids = cluster_ids
 
     def set_quantized_sh(self, features_rest_q: torch.Tensor, cluster_ids: torch.Tensor):
-        assert features_rest_q.shape[:2] == self._features_rest.shape[:2], \
-            f"SH q-shape mismatch: got {features_rest_q.shape}, expect (N,K,*) like {self._features_rest.shape}"
+        if self._features_rest is not None:
+            assert features_rest_q.shape[:2] == self._features_rest.shape[:2], \
+                f"SH q-shape mismatch: got {features_rest_q.shape}, expect (N,K,*) like {self._features_rest.shape}"
         self._features_rest_q = features_rest_q
         self.sh_cluster_ids = cluster_ids
 
     def clear_quantized(self):
         dev = (
             self._xyz.device if self._xyz.numel() > 0 else
-            (self._features_dc.device if self._features_dc.numel() > 0 else torch.device("cpu"))
+            (self._features_dc.device if self._features_dc is not None and self._features_dc.numel() > 0 else torch.device("cpu"))
         )
         self._features_dc_q = torch.empty(0, device=dev)
         self._features_rest_q = torch.empty(0, device=dev)
         self.dc_cluster_ids = None
         self.sh_cluster_ids = None
 
-    # -------------------------
-    # Snapshot
-    # -------------------------
     def capture(self):
         return (
             self.active_sh_degree,
@@ -137,9 +130,6 @@ class GaussianModel:
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
 
-    # -------------------------
-    # Properties
-    # -------------------------
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
@@ -154,17 +144,27 @@ class GaussianModel:
 
     @property
     def get_features(self):
-        features_dc = self._features_dc_q if self._features_dc_q.numel() > 0 else self._features_dc
-        features_rest = self._features_rest_q if self._features_rest_q.numel() > 0 else self._features_rest
+        features_dc = self.get_features_dc
+        features_rest = self.get_features_rest
         return torch.cat((features_dc, features_rest), dim=1)
 
     @property
     def get_features_dc(self):
-        return self._features_dc_q if self._features_dc_q.numel() > 0 else self._features_dc
+        if self._features_dc_q.numel() > 0:
+            return self._features_dc_q
+        elif self._features_dc is not None:
+            return self._features_dc
+        else:
+            raise RuntimeError("No features available")
 
     @property
     def get_features_rest(self):
-        return self._features_rest_q if self._features_rest_q.numel() > 0 else self._features_rest
+        if self._features_rest_q.numel() > 0:
+            return self._features_rest_q
+        elif self._features_rest is not None:
+            return self._features_rest
+        else:
+            raise RuntimeError("No features available")
 
     @property
     def get_opacity(self):
@@ -177,9 +177,6 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    # -------------------------
-    # Init & training setup
-    # -------------------------
     def create_from_pcd(self, pcd: BasicPointCloud, spatial_lr_scale: float):
         assert torch.cuda.is_available(), "This pipeline currently requires CUDA."
         dev = torch.device("cuda")
@@ -193,11 +190,10 @@ class GaussianModel:
 
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), dtype=torch.float32, device=dev)
         features[:, :3, 0] = fused_color
-        features[:, :, 1:] = 0.0  # 明确置零，避免脏值
+        features[:, :, 1:] = 0.0
 
         print("Number of points at initialisation:", fused_point_cloud.shape[0])
 
-        # distCUDA2 需要 CUDA tensor
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud), 1e-7)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
 
@@ -242,20 +238,13 @@ class GaussianModel:
         )
 
     def update_learning_rate(self, iteration):
-        """Per-step LR schedule for xyz group."""
         for param_group in self.optimizer.param_groups:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
                 return lr
 
-    # -------------------------
-    # PLY I/O
-    # -------------------------
     def construct_list_of_attributes(self, save_att=None, save_q=None):
-        """
-        仅用于命名参考（save_ply 内部不再依赖它来对齐列顺序）。
-        """
         if save_att is None:
             save_att = ['xyz', 'f_dc', 'f_rest', 'opacity', 'scale', 'rotation']
         if save_q is None:
@@ -303,26 +292,22 @@ class GaussianModel:
         q_dc = ('dc' in save_q) and (self._features_dc_q.numel() > 0) and (self.dc_cluster_ids is not None)
         q_sh = ('sh' in save_q) and (self._features_rest_q.numel() > 0) and (self.sh_cluster_ids is not None)
 
-        # Build arrays & dtype blocks（严格按 save_attributes 顺序）
         all_arrays = {}
         all_dtypes = {}
 
-        # xyz
         xyz = self._xyz.detach().cpu().numpy()
         all_arrays['xyz'] = xyz
         all_dtypes['xyz'] = [('x', 'f4'), ('y', 'f4'), ('z', 'f4')]
 
-        # f_dc
         if q_dc:
             arr = self.dc_cluster_ids.detach().cpu().numpy().astype(np.int32).reshape(-1, 1)
             all_arrays['f_dc'] = arr
             all_dtypes['f_dc'] = [('f_dc_idx', 'i4')]
         else:
             arr = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-            all_arrays['f_dc'] = arr  # (N,3)
+            all_arrays['f_dc'] = arr
             all_dtypes['f_dc'] = [('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4')]
 
-        # f_rest
         if q_sh:
             arr = self.sh_cluster_ids.detach().cpu().numpy().astype(np.int32).reshape(-1, 1)
             all_arrays['f_rest'] = arr
@@ -333,17 +318,14 @@ class GaussianModel:
             all_arrays['f_rest'] = arr
             all_dtypes['f_rest'] = [(f'f_rest_{i}', 'f4') for i in range(ncols)]
 
-        # opacity
         opacities = self._opacity.detach().cpu().numpy()
         all_arrays['opacity'] = opacities
         all_dtypes['opacity'] = [('opacity', 'f4')]
 
-        # scale
         scale = self._scaling.detach().cpu().numpy()
         all_arrays['scale'] = scale
         all_dtypes['scale'] = [(f'scale_{i}', 'f4') for i in range(scale.shape[1])]
 
-        # rotation
         rotation = self._rotation.detach().cpu().numpy()
         all_arrays['rotation'] = rotation
         all_dtypes['rotation'] = [(f'rot_{i}', 'f4') for i in range(rotation.shape[1])]
@@ -351,12 +333,10 @@ class GaussianModel:
         if save_attributes is None:
             save_attributes = ['xyz', 'f_dc', 'f_rest', 'opacity', 'scale', 'rotation']
 
-        # dtype in strict order
         dtype_fields = []
         for key in save_attributes:
             dtype_fields.extend(all_dtypes[key])
 
-        # concat cols in strict order
         cols = [all_arrays[key] for key in save_attributes]
         attributes = np.concatenate(cols, axis=1)
 
@@ -379,15 +359,12 @@ class GaussianModel:
         prop = plydata.elements[0]
         prop_names = [p.name for p in prop.properties]
 
-        # xyz & opacity
         xyz = np.stack((np.asarray(prop["x"]), np.asarray(prop["y"]), np.asarray(prop["z"])), axis=1)
         opacities = np.asarray(prop["opacity"])[..., np.newaxis]
 
-        # detect quantized fields
         has_dc_idx = "f_dc_idx" in prop_names
         has_sh_idx = "f_rest_idx" in prop_names
 
-        # DC
         if has_dc_idx:
             dc_idx = np.asarray(prop["f_dc_idx"]).astype(np.int64)
             features_dc = None
@@ -395,10 +372,9 @@ class GaussianModel:
             f0 = np.asarray(prop["f_dc_0"])
             f1 = np.asarray(prop["f_dc_1"])
             f2 = np.asarray(prop["f_dc_2"])
-            features_dc = np.stack([f0, f1, f2], axis=1)[:, :, None]  # (N,3,1)
+            features_dc = np.stack([f0, f1, f2], axis=1)[:, :, None]
             dc_idx = None
 
-        # SH(rest)
         if has_sh_idx:
             sh_idx = np.asarray(prop["f_rest_idx"]).astype(np.int64)
             features_extra = None
@@ -408,16 +384,14 @@ class GaussianModel:
             features_extra = np.zeros((xyz.shape[0], F), dtype=np.float32)
             for i, attr_name in enumerate(extra_f_names):
                 features_extra[:, i] = np.asarray(prop[attr_name])
-            features_extra = features_extra.reshape((features_extra.shape[0], 3, -1))  # (N,3,coeffs-1)
+            features_extra = features_extra.reshape((features_extra.shape[0], 3, -1))
             sh_idx = None
 
-        # scale / rotation
         scale_names = sorted([n for n in prop_names if n.startswith("scale_")], key=lambda x: int(x.split('_')[-1]))
         rot_names = sorted([n for n in prop_names if n.startswith("rot_")], key=lambda x: int(x.split('_')[-1]))
         scales = np.stack([np.asarray(prop[n]) for n in scale_names], axis=1)
         rots = np.stack([np.asarray(prop[n]) for n in rot_names], axis=1)
 
-        # assign tensors
         self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float32, device=dev).requires_grad_(True))
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float32, device=dev).requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float32, device=dev).requires_grad_(True))
@@ -428,7 +402,6 @@ class GaussianModel:
             self._features_dc_q = torch.empty(0, device=dev)
             self.dc_cluster_ids = None
         else:
-            # quantized only indices
             self._features_dc = nn.Parameter(torch.zeros((xyz.shape[0], 1, 3), dtype=torch.float32, device=dev).requires_grad_(True))
             self._features_dc_q = torch.empty(0, device=dev)
             self.dc_cluster_ids = torch.from_numpy(dc_idx).to(device=dev, dtype=torch.long)
@@ -446,7 +419,6 @@ class GaussianModel:
         self.active_sh_degree = self.max_sh_degree
 
     def load_blocks_ply(self, plys_dirpath):
-        # 兼容老格式的多块拼接加载（不含索引）
         xyz_all, features_dc_all, features_extra_all, opacities_all, scales_all, rots_all = [], [], [], [], [], []
         for block_plyfile in os.listdir(plys_dirpath):
             ply_filepath = os.path.join(plys_dirpath, block_plyfile)
@@ -474,9 +446,6 @@ class GaussianModel:
         self._rotation = torch.tensor(rots_all, dtype=torch.float32, device=dev)
         self.active_sh_degree = self.max_sh_degree
 
-    # -------------------------
-    # Optimizer tensor surgery
-    # -------------------------
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
@@ -484,13 +453,11 @@ class GaussianModel:
                 continue
             old_param = group["params"][0]
             state = self.optimizer.state.get(old_param, {})
-            # preserve state shapes; if missing, init zeros
             exp_avg = state.get("exp_avg", torch.zeros_like(old_param))
             exp_avg_sq = state.get("exp_avg_sq", torch.zeros_like(old_param))
             exp_avg = torch.zeros_like(tensor) if exp_avg.shape != tensor.shape else exp_avg.to(tensor)
             exp_avg_sq = torch.zeros_like(tensor) if exp_avg_sq.shape != tensor.shape else exp_avg_sq.to(tensor)
 
-            # swap param
             if old_param in self.optimizer.state:
                 del self.optimizer.state[old_param]
             new_param = nn.Parameter(tensor.requires_grad_(True))
@@ -562,9 +529,6 @@ class GaussianModel:
                 optimizable_tensors[group["name"]] = group["params"][0]
         return optimizable_tensors
 
-    # -------------------------
-    # Densify pipeline
-    # -------------------------
     def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation):
         d = {
             "xyz": new_xyz,
@@ -583,20 +547,18 @@ class GaussianModel:
         self._scaling = optim["scaling"]
         self._rotation = optim["rotation"]
 
-        # init quantized buffers for new points
         if self._features_dc_q.numel() > 0:
-            new_dc_q = torch.zeros_like(new_features_dc)
+            dev = self._features_dc.device
+            new_dc_q = torch.zeros((new_features_dc.shape[0], self._features_dc_q.shape[1], self._features_dc_q.shape[2]), device=dev)
             self._features_dc_q = torch.cat((self._features_dc_q, new_dc_q), dim=0)
-        if self._features_rest_q.numel() > 0:
-            new_rest_q = torch.zeros_like(new_features_rest)
-            self._features_rest_q = torch.cat((self._features_rest_q, new_rest_q), dim=0)
-
-        if self.dc_cluster_ids is not None:
-            new_dc_ids = torch.zeros(new_features_dc.shape[0], dtype=torch.long, device=new_features_dc.device)
+            new_dc_ids = torch.full((new_features_dc.shape[0],), -1, dtype=torch.long, device=dev)
             self.dc_cluster_ids = torch.cat((self.dc_cluster_ids, new_dc_ids), dim=0)
-        if self.sh_cluster_ids is not None:
-            new_sh_ids = torch.zeros(new_features_rest.shape[0], dtype=torch.long, device=new_features_rest.device)
-            self.sh_cluster_ids = torch.cat((self.sh_cluster_ids, new_sh_ids), dim=0)
+        if self._features_rest_q.numel() > 0:
+            dev = self._features_rest.device
+            new_rest_q = torch.zeros((new_features_rest.shape[0], self._features_rest_q.shape[1], self._features_rest_q.shape[2]), device=dev)
+            self._features_rest_q = torch.cat((self._features_rest_q, new_rest_q), dim=0)
+            new_rest_ids = torch.full((new_features_rest.shape[0],), -1, dtype=torch.long, device=dev)
+            self.sh_cluster_ids = torch.cat((self.sh_cluster_ids, new_rest_ids), dim=0)
 
         dev = self._xyz.device
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device=dev)
@@ -633,8 +595,8 @@ class GaussianModel:
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
         new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
-        new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
-        new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
+        new_features_dc = self.get_features_dc[selected_pts_mask].repeat(N, 1, 1)
+        new_features_rest = self.get_features_rest[selected_pts_mask].repeat(N, 1, 1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N, 1)
 
         self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation)
@@ -663,8 +625,8 @@ class GaussianModel:
             selected_pts_mask = torch.logical_and(block_bbx_mask, selected_pts_mask)
 
         new_xyz = self._xyz[selected_pts_mask]
-        new_features_dc = self._features_dc[selected_pts_mask]
-        new_features_rest = self._features_rest[selected_pts_mask]
+        new_features_dc = self.get_features_dc[selected_pts_mask]
+        new_features_rest = self.get_features_rest[selected_pts_mask]
         new_opacities = self._opacity[selected_pts_mask]
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
@@ -689,9 +651,6 @@ class GaussianModel:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    # -------------------------
-    # Grad stats
-    # -------------------------
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         if viewspace_point_tensor.grad is not None:
             self.xyz_gradient_accum[update_filter] += torch.norm(
@@ -702,9 +661,18 @@ class GaussianModel:
             self.denom[update_filter] += 1
 
     def reset_opacity(self):
-        """Reset opacity to initial values during training."""
         if self._opacity.numel() > 0:
             dev = self._opacity.device
             opacities_new = self.inverse_opacity_activation(0.01 * torch.ones((self._opacity.shape[0], 1), dtype=torch.float32, device=dev))
             optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
             self._opacity = optimizable_tensors["opacity"]
+
+    def clear_original_features(self):
+        if self._features_dc_q.numel() > 0 and self._features_dc is not None:
+            del self._features_dc
+            self._features_dc = None
+        if self._features_rest_q.numel() > 0 and self._features_rest is not None:
+            del self._features_rest
+            self._features_rest = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

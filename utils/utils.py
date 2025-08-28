@@ -75,8 +75,17 @@ def fetch_ply(path, scene_scale=1.0):
     plydata = PlyData.read(path)
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T * scene_scale
-    colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    names = vertices.data.dtype.names
+    # Colors may be missing in some PLYs
+    if all(n in names for n in ('red', 'green', 'blue')):
+        colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
+    else:
+        colors = np.ones_like(positions, dtype=np.float32)
+    # Normals may be missing too
+    if all(n in names for n in ('nx', 'ny', 'nz')):
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(positions, dtype=np.float32)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 
