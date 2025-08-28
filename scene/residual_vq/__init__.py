@@ -1,4 +1,4 @@
-I# scene/residual_vq/__init__.py
+# scene/residual_vq/__init__.py
 # Unified RVQ interface - Quantize_RVQ handles both single-layer (K-Means) and multi-layer RVQ
 from .rvq_adapter import Quantize_RVQ
 from .rvq_apply import rvq_apply, rvq_apply_dict
